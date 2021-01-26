@@ -22,6 +22,11 @@ from scipy import stats
 #
 #######################
 
+def excel_date(date1):
+    temp = datetime.datetime(1899, 12, 30)    
+    delta = date1 - temp
+    return float(delta.days) + (float(delta.seconds) / 86400)
+
 def calc_annualized_appreciation(years, total_return):
     return None
 
@@ -613,7 +618,7 @@ def create_list_of_returns(buy_and_hold_dictionary, daily_returns_dictionary):
         except:
             furthest_return = None
             
-        long_term_returns_by_day[e] = {'date': str(buy_and_hold_dictionary[e]['month']) + "-" + str(buy_and_hold_dictionary[e]['day']) + "-" + str(buy_and_hold_dictionary[e]['year']),
+        long_term_returns_by_day[e] = {'date': excel_date(datetime.datetime(buy_and_hold_dictionary[e]['year'], buy_and_hold_dictionary[e]['month'], buy_and_hold_dictionary[e]['day'])),
                                        'one_month': one_month_return,
                                        'one_year': one_year_return,
                                        'five_year': five_year_return,
@@ -644,10 +649,9 @@ def create_daily_returns_and_print_to_excel(location_of_excel_folders, days_for_
     with xlsxwriter.Workbook(location_of_excel_folders + 'long_term_returns_by_day.xlsx') as workbook:
         
         for duration in ['one_month', 'one_year', 'five_year', 'ten_year', 'furthest_return']:
-            list_to_write = [["Timestamp", "Date", "Buy and Hold", "Buy and Hold 3x", str(days_for_moving_average) + " Day 3x", "VIX 3x", "Combo 3x"]]
+            list_to_write = [["Date", "Buy and Hold", "Buy and Hold 3x", str(days_for_moving_average) + " Day 3x", "VIX 3x", "Combo 3x"]]
             for e in long_term_returns_by_day_buy_and_hold:
-                list_to_write.append([e,
-                                      long_term_returns_by_day_buy_and_hold[e]['date'],
+                list_to_write.append([long_term_returns_by_day_buy_and_hold[e]['date'],
                                       long_term_returns_by_day_buy_and_hold[e][duration],
                                       long_term_returns_by_day_buy_and_hold_3x[e][duration],
                                       long_term_returns_by_day_moving_avg_3x[e][duration],
@@ -660,25 +664,34 @@ def create_daily_returns_and_print_to_excel(location_of_excel_folders, days_for_
     return None
 
 
-##def graph_strategy_against_comparison_stock(strategy_daily_returns, comparison):
-##    stock_last_price = 0
-##    list_to_write = [["Date", "Stock Price", "Stock Percent Change", "Strategy Return"]]
-##    for e in comparison:
-##        if stock_last_price == 0:
-##            stock_last_price = comparison[e]['open']
-##
-##        date =
-##        stock_price =
-##        stock_percent_change = 
-##        if e in strategy_daily_returns:
-##            strategy_return = strategy_daily_returns[e]['close']
-##
-##        else:
-##            strategy_return = ""
-##
-##        list_to_write.append([date, stock_price, stock_percent_change, strategy_return])
-##        stock_last_price = comparison[e]['close']
-##    return None
+def graph_strategy_against_comparison_stock(daily_returns_buy_and_hold, daily_returns_for_strategy, sheet_title):
+    stock_last_value = 1
+    strategy_last_value = 1
+    strategy_aggregate_return = 1
+    
+    list_to_write = [["Date", "Stock Aggregate Return", "Stock Daily Return", "Strategy Aggregate Return", "Strategy Daily Return"]]
+    for e in daily_returns_buy_and_hold:
+        
+        date = excel_date(datetime.datetime(daily_returns_buy_and_hold[e]['year'], daily_returns_buy_and_hold[e]['month'], daily_returns_buy_and_hold[e]['day']))
+        stock_aggregate_return = round(((daily_returns_buy_and_hold[e]['close']-1)/1)*100, 2)
+        stock_daily_return = round(((daily_returns_buy_and_hold[e]['close'] - stock_last_value)/stock_last_value)*100, 2)
+        
+        if e in daily_returns_for_strategy:
+            strategy_aggregate_return = round(((daily_returns_for_strategy[e]['close']-1)/1)*100, 2)
+            strategy_daily_return = round(((daily_returns_for_strategy[e]['close'] - strategy_last_value)/strategy_last_value)*100, 2)
+            strategy_last_value = daily_returns_for_strategy[e]['close']
+        else:
+            strategy_daily_return = ""
+
+        list_to_write.append([date, stock_aggregate_return, stock_daily_return, strategy_aggregate_return, strategy_daily_return])
+        stock_last_value = daily_returns_buy_and_hold[e]['close']
+
+    with xlsxwriter.Workbook(location_of_excel_folders + 'graph_strategy_against_comparison_stock.xlsx') as workbook:
+        worksheet = workbook.add_worksheet()
+        for row_num, data in enumerate(list_to_write):
+            worksheet.write_row(row_num, 0, data)
+        
+    return None
             
     
 
@@ -696,19 +709,20 @@ def create_daily_returns_and_print_to_excel(location_of_excel_folders, days_for_
     # STARTING ASSUMPTIONS
     #
     #######################
-location_of_excel_folders = "C:/Users/PC5/Desktop/vix_analysis/"    
-comparison_stock = "SPY" #this allows qqq, spy, tqqq, spxl
+    
+location_of_excel_folders = "./vix_analysis/"    
+comparison_stock = "QQQ" #this allows qqq, spy, tqqq, spxl
 leverage_multiple = 3
 
 vix_threshold = 18
 
 days_for_moving_average = 50
 
-percent_above_moving_average_threshold = 26 #percent as two-digit integer - will buy when that percent of previous days was above
+percent_above_moving_average_threshold = 20 #percent as two-digit integer - will buy when that percent of previous days was above
 
 #vix velocity doesnt seem to be a good metric
 velocity_threshold = 50 #percentiles, lower percentile translates to lower slope
-velocity_time_period = "ten_day" #options: one_day,ten_day,thirty_day
+velocity_time_period = "thirty_day" #options: one_day,ten_day,thirty_day
 
 
 
@@ -751,8 +765,6 @@ vix, comparison_limited_to_vix_dates = make_data_sets_the_same_dates(vix, compar
 stock_holding_buy_and_hold, number_of_buys_buy_and_hold = create_dictionary_of_periods_when_holding_stock_vix_strategy(vix, comparison_limited_to_vix_dates, 1000)
 running_tally_buy_and_hold, running_tally_3x_buy_and_hold, returns_by_month_buy_and_hold, returns_by_month_3x_buy_and_hold, daily_returns_buy_and_hold, daily_returns_3x_buy_and_hold = calculate_return_of_stock_during_holding_periods(stock_holding_buy_and_hold, leverage_multiple)
 
-
-
 #MOVING AVERAGE  
 stock_holding_moving_avg, number_of_buys_moving_avg = create_dictionary_of_periods_when_holding_stock_moving_avg_strategy(moving_average_by_day, comparison)
 running_tally_moving_avg, running_tally_3x_moving_avg, returns_by_month_moving_avg, returns_by_month_3x_moving_avg, daily_returns_moving_avg, daily_returns_3x_moving_avg = calculate_return_of_stock_during_holding_periods(stock_holding_moving_avg, leverage_multiple)
@@ -774,16 +786,21 @@ running_tally_velocity, running_tally_3x_velocity, returns_by_month_velocity, re
 stock_holding_combo, number_of_buys_combo = create_dictionary_of_periods_when_holding_stock_combo_strategy(vix, moving_average_by_day, vix_threshold, comparison)
 running_tally_combo, running_tally_3x_combo, returns_by_month_combo, returns_by_month_3x_combo, daily_returns_combo, daily_returns_3x_combo = calculate_return_of_stock_during_holding_periods(stock_holding_combo, leverage_multiple)
 
-
+    #######################
+    #
+    # EXCEL
+    #
+    #######################
+    
 #write daily long term returns to excel
 #create_daily_returns_and_print_to_excel(location_of_excel_folders, days_for_moving_average, stock_holding_buy_and_hold, daily_returns_buy_and_hold, daily_returns_3x_buy_and_hold, daily_returns_3x_moving_avg, daily_returns_3x_vix, daily_returns_3x_combo)
+graph_strategy_against_comparison_stock(daily_returns_buy_and_hold, daily_returns_3x_combo, "Combo 3x")
 
-
-#######################
-#
-# REPORT
-#
-#######################
+    #######################
+    #
+    # PRINTED REPORT
+    #
+    #######################
 
 
 starting_data = ""
