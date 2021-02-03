@@ -154,740 +154,251 @@ def get_vix_data(location_of_excel_folders):
     prices_by_time = []
     book = open_workbook(location_of_excel_folders + "vix.xls")
     sheet = book.sheet_by_index(0)
+        single_day_data = {'year': year,
+                           'day': day,
+                           'timestamp': timestamp,
+                           'human_readable_date': human_readable_date,
+                           'open': stock_open,
+                           'close': stock_close
+                           }
+        return single_day_data
+    return None
 
-    # read first row for keys  
-    keys = sheet.row_values(0)
+def extract_one_row_of_stock_data(book, row):
+    stock_open = row[1].value
+    stock_close = row[2].value
+    excel_date = row[0].value
+    year, month, day, hour, minute, second, human_readable_date, timestamp = convert_excel_date_to_component_parts(book, excel_date)
+    return build_dictionary_of_single_day_data(year, month, day, timestamp, human_readable_date, stock_open, stock_close)
 
-    # read the rest rows for values
+def load_stock_data(Assumptions):
+    stock = {}
+    book, sheet = get_sheet_from_excel(Assumptions, Assumptions.stock + ".xls")
     counter = 0
-    for e in sheet:
+    for row in sheet:
         if counter > 0:
-            if e[1].value != "n/a":
-                try:
-                    #extract date from excel is special process
-                    book_datemode = book.datemode
-                    year, month, day, hour, minute, second = xlrd.xldate_as_tuple(e[0].value, book.datemode)
-                    timestamp = time.mktime(datetime.datetime.strptime(str(year) + "-" + str(month) + "-" +  str(day), "%Y-%m-%d").timetuple())
-                    
-                    prices_by_time.append({'timestamp': timestamp,
-                                           'actual_day': str(year) + "-" + str(month) + "-" +  str(day),
-                                           'open': e[1].value,
-                                           'high': e[2].value,
-                                           'low': e[3].value,
-                                           'close': e[4].value,
-                                           'adjusted_close': None,
-                                           'split_coefficient': None,
-                                           'dividend': None})
-                except:
-                    print(traceback.format_exc())
+            single_day_data = extract_one_row_of_stock_data(book, row)
+            if single_day_data != None:
+                stock[single_day_data['human_readable_date']] = single_day_data
         counter += 1
+    return stock
+        
+#######################
+#
+# METRICS BY DAY
+#
+#######################
 
-    prices_by_time = sorted(prices_by_time, key= lambda x: x['timestamp'])   
+def calc_moving_avg_by_day(stock, days_for_moving_average):
+    moving_average_by_day = {}
+    stock_values = []
+    days = 0
+    for date in stock:
+        sum_of_stock_values = 0
+        if days >= days_for_moving_average:
+            for close_price in stock_values[-1*days_for_moving_average:]:
+                sum_of_stock_values += close_price
+            moving_average_by_day[date] = sum_of_stock_values/days_for_moving_average
+        else:
+            moving_average_by_day[date] = None
+        stock_values.append(stock[date]['close'])
+        days += 1
+    return moving_average_by_day
 
-    dictionary = {}
-    for e in prices_by_time:
-        dictionary[e['timestamp']] = e
+def extract_one_row_of_vix_data(book, row):
+    vix_open = row[1].value
+    vix_close = row[4].value
+    excel_date = row[0].value
+    year, month, day, hour, minute, second, human_readable_date, timestamp = convert_excel_date_to_component_parts(book, excel_date)
+    return build_dictionary_of_single_day_data(year, month, day, timestamp, human_readable_date, vix_open, vix_close)
 
-    return dictionary
+def load_vix_data(Assumptions):
+    vix = {}
+    book, sheet = get_sheet_from_excel(Assumptions, "vix.xls")
+    counter = 0
+    for row in sheet:
+        if counter > 0:
+            single_day_data = extract_one_row_of_vix_data(book, row)
+            if single_day_data != None:
+                vix[single_day_data['human_readable_date']] = single_day_data
+        counter += 1
+    return vix
 
+class Metrics:
+
+    def __init__(self, Assumptions, stock):
+        self.vix = load_vix_data(Assumptions)
+        self.moving_average_by_day_long = calc_moving_avg_by_day(stock, Assumptions.days_for_moving_average_long)
+        self.moving_average_by_day_short = calc_moving_avg_by_day(stock, Assumptions.days_for_moving_average_short)
 
 
 #######################
 #
-# MAKE DATA SETS THE SAME DATES (COMPARISONS SHOULD BE OF TWO DATA SETS WITH SAME DATES AND, THUS, SAME SIZE)
+# TRIGGERS BY DAY
 #
 #######################
 
-def make_data_sets_the_same_dates(data1, data2):
-    new_data1 = {}
-    new_data2 = {}
+def check_whether_vix_is_below_threshold_by_day(Assumptions, Metrics):
+    vix_position_below_treshold = {}
+    for date in Metrics.vix:
+        vix_position_below_treshold[date] = {}
+        if Metrics.vix[date]['open'] <= Assumptions.vix_threshold:
+            vix_position_below_treshold[date]['open'] = True
+        else:
+            vix_position_below_treshold[date]['open'] = False
 
-    for e in data2:
-        if e in data1:
-            new_data1[e] = data1[e]
-
-    for e in new_data1:
-        if e in data2:
-            new_data2[e] = data2[e]
-
-    return new_data1, new_data2
             
+        if Metrics.vix[date]['close'] <= Assumptions.vix_threshold:
+            vix_position_below_treshold[date]['close'] = True
+        else:
+            vix_position_below_treshold[date]['close'] = False
+            
+    return vix_position_below_treshold
+        
+
+
+
+class Triggers:
+
+    def __init__(self, Assumptions, stock, Metrics):
+        self.vix_position_below_treshold = check_whether_vix_is_below_threshold_by_day(Assumptions, Metrics)
+
+
 
 #######################
 #
-# VIX VELOCITY STRATEGY
+# RETURNS FOR EACH STRATEGY
 #
 #######################
-def create_dictionary_of_periods_when_holding_stock_velocity_strategy(vix_velocity, velocity_time_period, velocity_threshold, comparison):
-    velocity_time_period = "percentile_" + velocity_time_period
-    list_of_comparison_keys = list(comparison.keys())
-    number_of_buys = 0
-    stock_holding = {}
-    buy = False
-    for e in comparison:
-        if e in vix_velocity and vix_velocity[e][velocity_time_period] != None:
-            dictionary = comparison[e]
-            if vix_velocity[e][velocity_time_period] <= velocity_threshold:
 
-                if buy == False:
-                    dictionary['buy'] = "buy"
-                    buy = True
-                    number_of_buys += 1
-                else:
-                    dictionary['buy'] = "hold"
-                stock_holding[e] = dictionary
+def create_buy_sell_orders(triggers_by_date):
+    last_day_we_have_data_for_stock = list(triggers_by_date.keys())[-1]
+    buy_and_sell_orders_by_day = {}
 
-                #if vix_velocity[e][velocity_time_period] > velocity_threshold:
-                    #buy = False
-                    #if stock_holding[e]['buy'] == "buy":
-                        #stock_holding[e]['buy'] = "buy and sell"
-                    #else:
-                        #stock_holding[e]['buy'] = "sell at close"
-                
-            else:
-                if buy == True:
-                    dictionary['buy'] = "sell"
-                    stock_holding[e] = dictionary
-                buy = False
-
-            if list_of_comparison_keys[-1] == e:
-                if buy == True:
-                    dictionary['buy'] = "sell at close"
-                    stock_holding[e] = dictionary
-                buy = False                
-                
-    return stock_holding, number_of_buys
-
-def calc_distribution_of_vix_velocity(vix_velocity, velocity_time_period):
-    vix_values_list = []
+    currently_holding_stock = False
     
-    for e in vix_velocity:
-        if vix_velocity[e][velocity_time_period] != None:
+    for date in triggers_by_date:
+        
+        if triggers_by_date[date]['open'] == True: 
+            if currently_holding_stock == False:
+                buy_and_sell_orders_by_day[date] = "buy"
+                currently_holding_stock = True
+            else:
+                buy_and_sell_orders_by_day[date] = "hold"
+
             try:
-                vix_values_list.append(vix_velocity[e][velocity_time_period])
+                if triggers_by_date[date]['close'] == False:
+                    currently_holding_stock = False
+                    if buy_and_sell_orders_by_day[date] == "buy":
+                        buy_and_sell_orders_by_day[date] = "buy and sell same day"
+                    else:
+                        buy_and_sell_orders_by_day[date] = "sell at close"
             except:
                 pass
 
-    percentiles = [stats.percentileofscore(vix_values_list, a, 'strict') for a in vix_values_list]
-    for e in vix_velocity:
-        try:
-            if vix_velocity[e][velocity_time_period] in vix_values_list:
-                vix_velocity[e]["percentile_" + velocity_time_period] = percentiles[vix_values_list.index(vix_velocity[e][velocity_time_period])]
-        except:
-            pass
-
-        
-    return vix_velocity
-
-def calc_vix_velocity(vix, velocity_time_period):
-    vix_velocity = {}
-    
-    vix_values = []
-    counter = 0
-    for e in vix:
-        intra_day = round((vix[e]['open'] - vix[e]['close'])/vix[e]['open'], 2)
-        one_day = None
-        ten_day = None
-        thirty_day = None
-        
-        if counter >= 1:
-            one_day = round((vix[e]['open'] - vix_values[-1])/vix_values[-1], 2)
-            
-        if counter >= 10:
-            ten_day = round((vix[e]['open'] - vix_values[-10])/vix_values[-10], 2)
-
-        if counter >= 30:
-            thirty_day = round((vix[e]['open'] - vix_values[-30])/vix_values[-30], 2)
-
-        vix_velocity[e] = {'actual_day': vix[e]['actual_day'],
-                           'vix_open': vix[e]['open'],
-                           'intra_day': intra_day,
-                           'one_day': one_day,
-                           'ten_day': ten_day,
-                           'thirty_day': thirty_day}
-        
-        vix_values.append(vix[e]['open'])
-        counter += 1
-        
-    vix_velocity = calc_distribution_of_vix_velocity(vix_velocity, velocity_time_period)
-    return vix_velocity
-
-#######################
-#
-# MOVING AVG AND VIX POSITION COMBO
-#
-#######################
-def create_dictionary_of_periods_when_holding_stock_combo_strategy(vix, moving_average_by_day, vix_threshold, comparison):
-    list_of_comparison_keys = list(comparison.keys())
-    number_of_buys = 0
-    stock_holding = {}
-    buy = False
-    for e in comparison:
-        if e in moving_average_by_day and moving_average_by_day[e] != None and e in vix:
-            dictionary = comparison[e]
-            if comparison[e]['open'] >= moving_average_by_day[e] or vix[e]['open'] <= vix_threshold:
-
-                if buy == False:
-                    dictionary['buy'] = "buy"
-                    buy = True
-                    number_of_buys += 1
-                else:
-                    dictionary['buy'] = "hold"
-                stock_holding[e] = dictionary
-
-                if comparison[e]['close'] < moving_average_by_day[e] and vix[e]['close'] > vix_threshold:
-                    buy = False
-                    if stock_holding[e]['buy'] == "buy":
-                        stock_holding[e]['buy'] = "buy and sell"
-                    else:
-                        stock_holding[e]['buy'] = "sell at close"
-                
-            else:
-                if buy == True:
-                    dictionary['buy'] = "sell"
-                    stock_holding[e] = dictionary
-                buy = False
-
-            if list_of_comparison_keys[-1] == e:
-                if buy == True:
-                    dictionary['buy'] = "sell at close"
-                    stock_holding[e] = dictionary
-                buy = False                
-                
-    return stock_holding, number_of_buys
-
-#######################
-#
-# MOVING AVG STRATEGY
-#
-#######################
-def create_dictionary_of_periods_when_holding_stock_moving_avg_strategy(moving_average_by_day, comparison):
-    list_of_comparison_keys = list(comparison.keys())
-    number_of_buys = 0
-    stock_holding = {}
-    buy = False
-    for e in comparison:
-        if e in moving_average_by_day and moving_average_by_day[e] != None:
-            dictionary = comparison[e]
-            if comparison[e]['open'] >= moving_average_by_day[e]:
-
-                if buy == False:
-                    dictionary['buy'] = "buy"
-                    buy = True
-                    number_of_buys += 1
-                else:
-                    dictionary['buy'] = "hold"
-                stock_holding[e] = dictionary
-                
-                if comparison[e]['close'] < moving_average_by_day[e]:
-                    buy = False
-                    if stock_holding[e]['buy'] == "buy":
-                        stock_holding[e]['buy'] = "buy and sell"
-                    else:
-                        stock_holding[e]['buy'] = "sell at close"
-
-                
-            else:
-                if buy == True:
-                    dictionary['buy'] = "sell"
-                    stock_holding[e] = dictionary
-                buy = False
-
-            if list_of_comparison_keys[-1] == e:
-                if buy == True:
-                    dictionary['buy'] = "sell at close"
-                    stock_holding[e] = dictionary
-                buy = False
-                
-    return stock_holding, number_of_buys
-
-def calc_moving_avg_moving_average(comparison, days_for_moving_average):
-    moving_average_by_day = {}
-    values = []
-    counter = 0
-    for e in comparison:
-        sum_of_values = 0
-        moving_average_by_day[e] = None
-        if counter >= days_for_moving_average:
-            for ele in range(0, len(values)):
-                sum_of_values = sum_of_values + values[ele]
-            moving_average_by_day[e] = sum_of_values/days_for_moving_average
-            values = values[1:] + [comparison[e]['close']]
         else:
-            values.append(comparison[e]['close'])
-        counter += 1
-    return moving_average_by_day
-    
-#######################
-#
-# PERCENT DAYS ABOVE MOVING AVERAGE STRATEGY
-#
-#######################
+            if currently_holding_stock == True:
+                buy_and_sell_orders_by_day[date] = "sell"
+            currently_holding_stock = False
 
-def create_dictionary_of_periods_when_holding_stock_percent_above_moving_avg_strategy(percent_above_moving_average, comparison, percent_above_moving_average_threshold):
-    list_of_comparison_keys = list(comparison.keys())
-    number_of_buys = 0
-    stock_holding = {}
-    buy = False
-    for e in comparison:
-        if e in percent_above_moving_average and percent_above_moving_average[e] != None:
-            dictionary = comparison[e]
-            if percent_above_moving_average[e] >= percent_above_moving_average_threshold:
-
-                if buy == False:
-                    dictionary['buy'] = "buy"
-                    buy = True
-                    number_of_buys += 1
-                else:
-                    dictionary['buy'] = "hold"
-                stock_holding[e] = dictionary
-
-                
-#THIS IS NOT RELEVANT TO THIS CODE.  KEPT IT SO YOU COULD EASILY SEE HOW WE DIVERGE.  MOVING AVERAGE BY DAY ISNT EVEN A PARAMETER OF THIS FUNCTION                
-##                if comparison[e]['close'] < moving_average_by_day[e]:
-##                    buy = False
-##                    if stock_holding[e]['buy'] == "buy":
-##                        stock_holding[e]['buy'] = "buy and sell"
-##                    else:
-##                        stock_holding[e]['buy'] = "sell at close"
-
-                
-            else:
-                if buy == True:
-                    dictionary['buy'] = "sell"
-                    stock_holding[e] = dictionary
-                buy = False
-
-            if list_of_comparison_keys[-1] == e:
-                if buy == True:
-                    dictionary['buy'] = "sell at close"
-                    stock_holding[e] = dictionary
-                buy = False
-                
-    return stock_holding, number_of_buys
-
-def calc_percent_above_moving_average(comparison, moving_average_by_day, days_for_moving_average):
-    percent_above_moving_average = {}
-    tally = []
-    for e in comparison:
-        if e in moving_average_by_day:
+        if date == last_day_we_have_data_for_stock and currently_holding_stock == True: 
             try:
-                if comparison[e]['open'] >= moving_average_by_day[e]: 
-                    tally.append(True)
+                if buy_and_sell_orders_by_day[date] == "buy":
+                    buy_and_sell_orders_by_day[date] = "buy and sell same day"
                 else:
-                    tally.append(False)
-
-                #count number of days above moving average
-                days_above_moving_average = 0
-                for above in tally[days_for_moving_average*-1:]:
-                    if above == True:
-                        days_above_moving_average += 1
-                        
-                percent_above_moving_average[e] = round((days_above_moving_average/days_for_moving_average) * 100)
-                #print(round((days_above_moving_average/days_for_moving_average) * 100))
+                    buy_and_sell_orders_by_day[date] = "sell at close"
             except:
-                #print(traceback.format_exc())
-                percent_above_moving_average[e] = None
-    return percent_above_moving_average
-                
-        
-
-#######################
-#
-# VIX POSITION STRATEGY
-#
-#######################
-
-def get_maximum_and_minimum_vix(vix):
-    maximum_vix = 0
-    minimum_vix = 10000000
-    for e in vix:
-        if vix[e]['close'] > maximum_vix:
-            maximum_vix = vix[e]['close']
-        if vix[e]['close'] < minimum_vix:
-            minimum_vix = vix[e]['close']
-    return maximum_vix, minimum_vix
-
-
-def create_dictionary_of_periods_when_holding_stock_vix_strategy(vix, comparison, vix_limit):
-    list_of_comparison_keys = list(comparison.keys())
-    number_of_buys = 0
-    stock_holding = {}
-    buy = False
-    for e in vix:
-        dictionary = comparison[e]
-        if vix[e]['open'] <= vix_limit:
+                buy_and_sell_orders_by_day[date] = "sell at close"
             
-            if buy == False:
-                dictionary['buy'] = "buy"
-                buy = True
-                number_of_buys += 1
-            else:
-                dictionary['buy'] = "hold"
-            stock_holding[e] = dictionary
+            currently_holding_stock = False
+            
+    return buy_and_sell_orders_by_day
 
-            if vix[e]['close'] > vix_limit:
-                buy = False
-                if stock_holding[e]['buy'] == "buy":
-                    stock_holding[e]['buy'] = "buy and sell"
+def add_running_tally_by_day_open_data(running_tally_by_day, running_tally_by_day_3x, date, running_tally, running_tally_3x, stock):
+    date_dictionary = {'month': stock[date]['month'],
+                        'day': stock[date]['day'],
+                        'year': stock[date]['year']}
+
+
+    running_tally_by_day[date] = date_dictionary
+    running_tally_by_day_3x[date] = date_dictionary
+    
+    running_tally_by_day[date]['open_running_tally'] = running_tally  
+    running_tally_by_day_3x[date]['open_running_tally'] = running_tally_3x
+    
+    return running_tally_by_day, running_tally_by_day_3x
+
+def add_running_tally_by_day_close_data(running_tally_by_day, running_tally_by_day_3x, date, running_tally, running_tally_3x, buy_and_sell_orders_by_day):
+    running_tally_by_day[date]['close_running_tally'] = running_tally
+    running_tally_by_day[date]['order'] = buy_and_sell_orders_by_day[date]
+    
+    running_tally_by_day_3x[date]['close_running_tally'] = running_tally_3x
+    running_tally_by_day_3x[date]['order'] = buy_and_sell_orders_by_day[date]
+    return running_tally_by_day, running_tally_by_day_3x
+
+
+def calculate_current_return(current_price, last_price, leverage_multiple, running_tally, running_tally_3x):
+    running_tally = running_tally * (1+ ((current_price - last_price)/last_price))
+    running_tally_3x = running_tally_3x * (1+ (((current_price - last_price)/last_price) * leverage_multiple))
+    return running_tally, running_tally_3x
+
+def calculate_return_of_stock(buy_and_sell_orders_by_day, stock, leverage_multiple):
+    running_tally = 1
+    running_tally_3x = 1
+
+    running_tally_by_day = {}
+    running_tally_by_day_3x = {}
+
+    last_price = False #switches to stock price after first buy order is fulfilled
+    for date in buy_and_sell_orders_by_day:
+        if date in stock:
+            if last_price is not False or buy_and_sell_orders_by_day[date] == "buy" or buy_and_sell_orders_by_day[date] == "buy and sell same day":
+                running_tally_by_day, running_tally_by_day_3x = add_running_tally_by_day_open_data(running_tally_by_day, running_tally_by_day_3x, date, running_tally, running_tally_3x, stock)
+
+                if buy_and_sell_orders_by_day[date] == "buy" or buy_and_sell_orders_by_day[date] == "buy and sell same day":
+                    last_price = stock[date]['open']
+
+                if buy_and_sell_orders_by_day[date] == "sell":
+                    running_tally, running_tally_3x = calculate_current_return(stock[date]['open'], last_price, leverage_multiple, running_tally, running_tally_3x)
+
+                elif buy_and_sell_orders_by_day[date] == "buy and sell same day" or buy_and_sell_orders_by_day[date] == "sell at close":
+                    running_tally, running_tally_3x = calculate_current_return(stock[date]['close'], last_price, leverage_multiple, running_tally, running_tally_3x)
+
                 else:
-                    stock_holding[e]['buy'] = "sell at close"
+                    running_tally, running_tally_3x = calculate_current_return(stock[date]['close'], last_price, leverage_multiple, running_tally, running_tally_3x)
+                    last_price = stock[date]['close']
 
-        else:
-            if buy == True:
-                dictionary['buy'] = "sell"
-                stock_holding[e] = dictionary
-            buy = False
-            
-        if list_of_comparison_keys[-1] == e:
-            if buy == True:
-                dictionary['buy'] = "sell at close"
-                stock_holding[e] = dictionary
-            buy = False
-            
-    return stock_holding, number_of_buys
+                running_tally_by_day, running_tally_by_day_3x = add_running_tally_by_day_close_data(running_tally_by_day, running_tally_by_day_3x, date, running_tally, running_tally_3x, buy_and_sell_orders_by_day)
+
+    return running_tally_by_day, running_tally_by_day_3x
 
 
-#######################
-#
-# CALC RETURNS BY DAY 
-#
-#######################
+class Single_Strategy_Returns:
 
-def return_values_as_close_to_desired_future_date_as_possible(daily_returns_dictionary, starting_timestamp, months_in_future, last_dictionary_value):
-    #months_in_future -1 indicates last date in dictionary
-    if months_in_future == -1:
-        return daily_returns_dictionary[last_dictionary_value['timestamp']]
-
-    time_in_future = datetime.datetime.fromtimestamp(starting_timestamp) + relativedelta(months=months_in_future)
-    timestamp_in_future = time.mktime(datetime.datetime.strptime(str(time_in_future.year) + "-" + str(time_in_future.month) + "-" +  str(time_in_future.day), "%Y-%m-%d").timetuple())
-
-    #find date as close to desired future date as possible (search backwards rather than forwards)
-    found = False
-    while found == False:
-        if timestamp_in_future > last_dictionary_value['timestamp'] or timestamp_in_future <= starting_timestamp:
-            return {'month': None, 'year': None, 'day': None, 'open': None, 'close': None}
-    
-        if timestamp_in_future in daily_returns_dictionary:
-            return daily_returns_dictionary[timestamp_in_future]
-
-        one_day_before = datetime.datetime.fromtimestamp(timestamp_in_future) + datetime.timedelta(days=-1)
-        timestamp_in_future = time.mktime(datetime.datetime.strptime(str(one_day_before.year) + "-" + str(one_day_before.month) + "-" +  str(one_day_before.day), "%Y-%m-%d").timetuple())
-
-    return {'month': None, 'year': None, 'day': None, 'open': None, 'close': None}
-            
-
-def create_list_of_returns(buy_and_hold_dictionary, daily_returns_dictionary):
-    long_term_returns_by_day = {}
-    open_value = 1
-    #buy and hold is here only to provide complete list of dates (daily returns will only provide data for days when stock was held)
-    last_dictionary_value = daily_returns_dictionary[(list(daily_returns_dictionary.keys())[-1])]
-    for e in buy_and_hold_dictionary:
-        try:
-            open_value = daily_returns_dictionary[e]['open']
-        except:
-            pass
+    def __init__(self, stock, buy_and_sell_orders, Assumptions):
+        running_tally_by_day, running_tally_by_day_3x = calculate_return_of_stock(buy_and_sell_orders, stock, Assumptions.leverage_multiple)
+        self.running_tally_by_day = running_tally_by_day
+        self.running_tally_by_day_3x = running_tally_by_day_3x
         
-        one_month_values = return_values_as_close_to_desired_future_date_as_possible(daily_returns_dictionary, e, 1, last_dictionary_value)
-        try:
-            one_month_return = round(((one_month_values['close'] - open_value)/open_value), 4)
-        except:
-            one_month_return = None
-        
-        one_year_values = return_values_as_close_to_desired_future_date_as_possible(daily_returns_dictionary, e, 12, last_dictionary_value)
-        try:
-            one_year_return = round(((one_year_values['close'] - open_value)/open_value), 4)
-        except:
-            one_year_return = None
-        
-        five_year_values = return_values_as_close_to_desired_future_date_as_possible(daily_returns_dictionary, e, 60, last_dictionary_value)
-        try:
-            five_year_return = round(((five_year_values['close'] - open_value)/open_value), 4)
-        except:
-            five_year_return = None
-        
-        ten_year_values = return_values_as_close_to_desired_future_date_as_possible(daily_returns_dictionary, e, 120, last_dictionary_value)
-        try:
-            ten_year_return = round(((ten_year_values['close'] - open_value)/open_value), 4)
-        except:
-            ten_year_return = None
-        
-        furthest_values = return_values_as_close_to_desired_future_date_as_possible(daily_returns_dictionary, e, -1, last_dictionary_value)
-        try:
-            furthest_return = round(((furthest_values['close'] - open_value)/open_value), 4)
-        except:
-            furthest_return = None
-            
-        long_term_returns_by_day[e] = {'date': excel_date(datetime.datetime(buy_and_hold_dictionary[e]['year'], buy_and_hold_dictionary[e]['month'], buy_and_hold_dictionary[e]['day'])),
-                                       'one_month': one_month_return,
-                                       'one_year': one_year_return,
-                                       'five_year': five_year_return,
-                                       'ten_year': ten_year_return,
-                                       'furthest_return': furthest_return} 
 
-        try:
-            open_value = daily_returns_dictionary[e]['close']
-        except:
-            pass
-    return long_term_returns_by_day
+class Returns:
 
-#######################
-#
-# EXCEL FUNCTIONS
-#
-#######################
+    def __init__(self, stock, Triggers, Assumptions):
+        self.vix_position_strategy = Single_Strategy_Returns(stock, create_buy_sell_orders(Triggers.vix_position_below_treshold), Assumptions)
 
 
-
-def create_daily_returns_and_print_to_excel(location_of_excel_folders, days_for_moving_average, stock_holding_buy_and_hold, daily_returns_buy_and_hold, daily_returns_3x_buy_and_hold, daily_returns_3x_moving_avg, daily_returns_3x_vix, daily_returns_3x_combo):
-    long_term_returns_by_day_buy_and_hold = create_list_of_returns(stock_holding_buy_and_hold, daily_returns_buy_and_hold)
-    long_term_returns_by_day_buy_and_hold_3x = create_list_of_returns(stock_holding_buy_and_hold, daily_returns_3x_buy_and_hold)
-    long_term_returns_by_day_moving_avg_3x = create_list_of_returns(stock_holding_buy_and_hold, daily_returns_3x_moving_avg)
-    long_term_returns_by_day_vix_3x = create_list_of_returns(stock_holding_buy_and_hold, daily_returns_3x_vix)
-    long_term_returns_by_day_combo_3x = create_list_of_returns(stock_holding_buy_and_hold, daily_returns_3x_combo)
-
-    with xlsxwriter.Workbook(location_of_excel_folders + 'long_term_returns_by_day.xlsx') as workbook:
-        
-        for duration in ['one_month', 'one_year', 'five_year', 'ten_year', 'furthest_return']:
-            list_to_write = [["Date", "Buy and Hold", "Buy and Hold 3x", str(days_for_moving_average) + " Day 3x", "VIX 3x", "Combo 3x"]]
-            for e in long_term_returns_by_day_buy_and_hold:
-                list_to_write.append([long_term_returns_by_day_buy_and_hold[e]['date'],
-                                      long_term_returns_by_day_buy_and_hold[e][duration],
-                                      long_term_returns_by_day_buy_and_hold_3x[e][duration],
-                                      long_term_returns_by_day_moving_avg_3x[e][duration],
-                                      long_term_returns_by_day_vix_3x[e][duration],
-                                      long_term_returns_by_day_combo_3x[e][duration],
-                                       ])
-            worksheet = workbook.add_worksheet(duration)
-            for row_num, data in enumerate(list_to_write):
-                worksheet.write_row(row_num, 0, data)
-    return None
-
-
-def graph_strategy_against_comparison_stock(daily_returns_buy_and_hold, daily_returns_for_strategy, sheet_title):
-    stock_last_value = 1
-    strategy_last_value = 1
-    strategy_aggregate_return = 1
-    
-    list_to_write = [["Date", "Stock Aggregate Return", "Stock Daily Return", "Strategy Aggregate Return", "Strategy Daily Return"]]
-    for e in daily_returns_buy_and_hold:
-        
-        date = excel_date(datetime.datetime(daily_returns_buy_and_hold[e]['year'], daily_returns_buy_and_hold[e]['month'], daily_returns_buy_and_hold[e]['day']))
-        stock_aggregate_return = round(((daily_returns_buy_and_hold[e]['close']-1)/1)*100, 2)
-        stock_daily_return = round(((daily_returns_buy_and_hold[e]['close'] - stock_last_value)/stock_last_value)*100, 2)
-        
-        if e in daily_returns_for_strategy:
-            strategy_aggregate_return = round(((daily_returns_for_strategy[e]['close']-1)/1)*100, 2)
-            strategy_daily_return = round(((daily_returns_for_strategy[e]['close'] - strategy_last_value)/strategy_last_value)*100, 2)
-            strategy_last_value = daily_returns_for_strategy[e]['close']
-        else:
-            strategy_daily_return = ""
-
-        list_to_write.append([date, stock_aggregate_return, stock_daily_return, strategy_aggregate_return, strategy_daily_return])
-        stock_last_value = daily_returns_buy_and_hold[e]['close']
-
-    with xlsxwriter.Workbook(location_of_excel_folders + 'graph_strategy_against_comparison_stock.xlsx') as workbook:
-        worksheet = workbook.add_worksheet()
-        for row_num, data in enumerate(list_to_write):
-            worksheet.write_row(row_num, 0, data)
-        
-    return None
-            
-    
-
-
-
-    
 #######################
 #
 # EXECUTE
 #
 #######################
+
+Assumptions = Assumptions()
+stock = load_stock_data(Assumptions)
+Metrics = Metrics(Assumptions, stock)
+Triggers = Triggers(Assumptions, stock, Metrics)
+Returns = Returns(stock, Triggers, Assumptions)
+
     
-    #######################
-    #
-    # STARTING ASSUMPTIONS
-    #
-    #######################
-    
-location_of_excel_folders = "./vix_analysis/"    
-comparison_stock = "QQQ" #this allows qqq, spy, tqqq, spxl
-leverage_multiple = 3
 
-vix_threshold = 18
-
-days_for_moving_average = 50
-
-percent_above_moving_average_threshold = 20 #percent as two-digit integer - will buy when that percent of previous days was above
-
-#vix velocity doesnt seem to be a good metric
-velocity_threshold = 50 #percentiles, lower percentile translates to lower slope
-velocity_time_period = "thirty_day" #options: one_day,ten_day,thirty_day
-
-
-
-    #######################
-    #
-    # GET AND LIMIT DATA SETS
-    #
-    #######################
-    
-vix = get_vix_data(location_of_excel_folders)
-comparison = get_stock_data_from_excel(comparison_stock, location_of_excel_folders)
-moving_average_by_day = calc_moving_avg_moving_average(comparison, days_for_moving_average)
-percent_above_moving_average = calc_percent_above_moving_average(comparison, moving_average_by_day, days_for_moving_average)
-
-#comparison = limit_stock_list_to_window_of_time(comparison, "1999-03-10", "2000-03-10") #Before Dot Com 
-#comparison = limit_stock_list_to_window_of_time(comparison, "2000-03-10", "2002-10-04") #Dot Com
-#comparison = limit_stock_list_to_window_of_time(comparison, "2002-10-04", "2008-05-01") #End Dot Com to Beginning Financial Crisis
-#comparison = limit_stock_list_to_window_of_time(comparison, "2008-05-01", "2009-03-20") #Financial Crisis
-#comparison = limit_stock_list_to_window_of_time(comparison, "2009-03-20", "2020-02-10") #End of Financial Crisis to Pandemic
-#comparison = limit_stock_list_to_window_of_time(comparison, "2020-02-10", "2020-03-") #Beginning of Pandemic to Bottom
-#comparison = limit_stock_list_to_window_of_time(comparison, "2020-03-", "2021-01-19") #Bottom to Today
-
-#comparison = limit_stock_list_to_window_of_time(comparison, "2009-03-20", "2021-01-15") #End of Financial Crisis to Today
-#comparison = limit_stock_list_to_window_of_time(comparison, "2002-10-04", "2021-01-15") #End of Dot Com to Today
-#comparison = limit_stock_list_to_window_of_time(comparison, "2010-02-11", "2021-01-15") #Since TQQQ was created
-#comparison = limit_stock_list_to_window_of_time(comparison, "2000-03-10", "2021-01-15") #Beginning Dot Com to Today
-
-
-
-vix_velocity = calc_vix_velocity(vix, velocity_time_period)
-vix, comparison_limited_to_vix_dates = make_data_sets_the_same_dates(vix, comparison)
-
-    #######################
-    #
-    # CALCULATE RESULTS
-    #
-    #######################
-
-#BUY AND HOLD OVER ENTIRE PERIOD
-stock_holding_buy_and_hold, number_of_buys_buy_and_hold = create_dictionary_of_periods_when_holding_stock_vix_strategy(vix, comparison_limited_to_vix_dates, 1000)
-running_tally_buy_and_hold, running_tally_3x_buy_and_hold, returns_by_month_buy_and_hold, returns_by_month_3x_buy_and_hold, daily_returns_buy_and_hold, daily_returns_3x_buy_and_hold = calculate_return_of_stock_during_holding_periods(stock_holding_buy_and_hold, leverage_multiple)
-
-#MOVING AVERAGE  
-stock_holding_moving_avg, number_of_buys_moving_avg = create_dictionary_of_periods_when_holding_stock_moving_avg_strategy(moving_average_by_day, comparison)
-running_tally_moving_avg, running_tally_3x_moving_avg, returns_by_month_moving_avg, returns_by_month_3x_moving_avg, daily_returns_moving_avg, daily_returns_3x_moving_avg = calculate_return_of_stock_during_holding_periods(stock_holding_moving_avg, leverage_multiple)
-
-#PERCENT ABOVE MOVING AVERAGE
-stock_holding_percent_above_moving_avg, number_of_buys_percent_above_moving_avg = create_dictionary_of_periods_when_holding_stock_percent_above_moving_avg_strategy(percent_above_moving_average, comparison, percent_above_moving_average_threshold)
-running_tally_percent_above_moving_avg, running_tally_3x_percent_above_moving_avg, returns_by_month_percent_above_moving_avg, returns_by_month_3x_percent_above_moving_avg, daily_returns_percent_above_moving_avg, daily_returns_3x_percent_above_moving_avg = calculate_return_of_stock_during_holding_periods(stock_holding_percent_above_moving_avg, leverage_multiple)
-
-#VIX POSITION
-stock_holding_vix, number_of_buys_vix = create_dictionary_of_periods_when_holding_stock_vix_strategy(vix, comparison_limited_to_vix_dates, vix_threshold)
-running_tally_vix, running_tally_3x_vix, returns_by_month_vix, returns_by_month_3x_vix, daily_returns_vix, daily_returns_3x_vix = calculate_return_of_stock_during_holding_periods(stock_holding_vix, leverage_multiple)
-
-#VIX VELOCITY
-stock_holding_velocity, number_of_buys_velocity = create_dictionary_of_periods_when_holding_stock_velocity_strategy(vix_velocity, velocity_time_period, velocity_threshold, comparison)
-running_tally_velocity, running_tally_3x_velocity, returns_by_month_velocity, returns_by_month_3x_velocity, daily_returns_velocity, daily_returns_3x_velocity = calculate_return_of_stock_during_holding_periods(stock_holding_velocity, leverage_multiple)
-
-
-#COMBO
-stock_holding_combo, number_of_buys_combo = create_dictionary_of_periods_when_holding_stock_combo_strategy(vix, moving_average_by_day, vix_threshold, comparison)
-running_tally_combo, running_tally_3x_combo, returns_by_month_combo, returns_by_month_3x_combo, daily_returns_combo, daily_returns_3x_combo = calculate_return_of_stock_during_holding_periods(stock_holding_combo, leverage_multiple)
-
-    #######################
-    #
-    # EXCEL
-    #
-    #######################
-    
-#write daily long term returns to excel
-#create_daily_returns_and_print_to_excel(location_of_excel_folders, days_for_moving_average, stock_holding_buy_and_hold, daily_returns_buy_and_hold, daily_returns_3x_buy_and_hold, daily_returns_3x_moving_avg, daily_returns_3x_vix, daily_returns_3x_combo)
-graph_strategy_against_comparison_stock(daily_returns_buy_and_hold, daily_returns_3x_combo, "Combo 3x")
-
-    #######################
-    #
-    # PRINTED REPORT
-    #
-    #######################
-
-
-starting_data = ""
-ending_data = ""
-for e in comparison:
-    if starting_data == "":
-        starting_data = comparison[e]
-    ending_data = comparison[e]
-
-print("STARTING: " + str(starting_data['actual_day']) + ", " + str(starting_data['open']))
-print()
-print("ENDING: " + str(ending_data['actual_day']) + ", " + str(ending_data['close']))
-
-print()
-print("BUY AND HOLD RETURNS:")
-print("DAYS IN THE MARKET: " + str(len(stock_holding_buy_and_hold)) + " OUT OF " + str(len(comparison)) + " DAYS")
-print("NUMBER OF BUYS: " + str(number_of_buys_buy_and_hold))
-print(comparison_stock + " non-leveraged returns: " + str(round(running_tally_buy_and_hold, 4)) + "x")
-print(comparison_stock + " " + str(leverage_multiple) + "x leveraged returns: " + str(round(running_tally_3x_buy_and_hold, 4)) + "x")
-print()
-print()
-print()
-
-print(str(vix_threshold) + " VIX RELATED RETURNS:")
-print("DAYS IN THE MARKET: " + str(len(stock_holding_vix)) + " OUT OF " + str(len(comparison)) + " DAYS")
-print("NUMBER OF BUYS: " + str(number_of_buys_vix))
-print(comparison_stock + " non-leveraged returns: " + str(round(running_tally_vix, 4)) + "x")
-print(comparison_stock + " " + str(leverage_multiple) + "x leveraged returns: " + str(round(running_tally_3x_vix, 4)) + "x")
-
-
-
-print()
-print()
-print()
-print("VIX VELOCITY RETURNS:")
-print("DAYS IN THE MARKET: " + str(len(stock_holding_velocity)) + " OUT OF " + str(len(comparison)) + " DAYS")
-print("NUMBER OF BUYS: " + str(number_of_buys_velocity))
-print(comparison_stock + " non-leveraged returns: " + str(round(running_tally_velocity, 4)) + "x")
-print(comparison_stock + " " + str(leverage_multiple) + "x leveraged returns: " + str(round(running_tally_3x_velocity, 4)) + "x")
-
-
-
-print()
-print()
-print()
-print(str(days_for_moving_average) + " DAY AVG RELATED RETURNS:")
-print("DAYS IN THE MARKET: " + str(len(stock_holding_moving_avg)) + " OUT OF " + str(len(comparison)) + " DAYS")
-print("NUMBER OF BUYS: " + str(number_of_buys_moving_avg))
-print(comparison_stock + " non-leveraged returns: " + str(round(running_tally_moving_avg, 4)) + "x")
-print(comparison_stock + " " + str(leverage_multiple) + "x leveraged returns: " + str(round(running_tally_3x_moving_avg, 4)) + "x")
-
-
-
-
-print()
-print()
-print()
-print("PERCENT ABOVE MOVING DAY AVG RELATED RETURNS:")
-print("DAYS IN THE MARKET: " + str(len(stock_holding_percent_above_moving_avg)) + " OUT OF " + str(len(comparison)) + " DAYS")
-print("NUMBER OF BUYS: " + str(number_of_buys_percent_above_moving_avg))
-print(comparison_stock + " non-leveraged returns: " + str(round(running_tally_percent_above_moving_avg, 4)) + "x")
-print(comparison_stock + " " + str(leverage_multiple) + "x leveraged returns: " + str(round(running_tally_3x_percent_above_moving_avg, 4)) + "x")
-
-
-
-
-print()
-print()
-print()
-print("COMBO RETURNS:")
-print("DAYS IN THE MARKET: " + str(len(stock_holding_combo)) + " OUT OF " + str(len(comparison)) + " DAYS")
-print("NUMBER OF BUYS: " + str(number_of_buys_combo))
-print(comparison_stock + " non-leveraged returns: " + str(round(running_tally_combo, 4)) + "x")
-print(comparison_stock + " " + str(leverage_multiple) + "x leveraged returns: " + str(round(running_tally_3x_combo, 4)) + "x")
-
-
-
-print()
-last_tally = 1
-last_tally_3x = 1
-
-##for e in returns_by_month_combo:
-##    value_for_month = round(((e[1] - last_tally)/last_tally)*100, 1)
-##    value_for_month_3x = round(((e[2] - last_tally_3x)/last_tally_3x)*100, 1)
-##    #if value_for_month_3x < 0:
-##    print(str(e[0]) + ":      " + str(value_for_month) + "%,     " + str(value_for_month_3x) + "%")
-##    last_tally = e[1]
-##    last_tally_3x = e[2]
-
-
+        
