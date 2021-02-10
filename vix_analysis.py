@@ -53,15 +53,16 @@ class Assumptions():
                  vix_velocity_upper_threshold = 90,#percentiles, higher percentile translates to higher slope, will buy between both thresholds
                  vix_velocity_lower_threshold = 10, 
                  days_for_vix_velocity = 10,
+                 days_out_after_significant_vix_velocity_move = 1,
                  
                  days_for_moving_avg_stock_velocity = 50,
                  moving_avg_stock_velocity_threshold = 0, #any number here is a percent, .02 is .02%, will buy when avg velocity is above x%
                  
                  days_for_avg_negative = 20,
 
-                 days_for_rsi_calculation = 50, #RSI attempts to calculate when the market is overbought or oversold
+                 days_for_rsi_calculation = 50, #RSI attempts to calculate when the market is overbought or oversold, high values = overbought scale of 1-100
                  rsi_high_sell_threshold = 60,
-                 rsi_low_sell_threshold = 50,): 
+                 rsi_low_sell_threshold = 50,):
         
         self.location_of_excel_folders = location_of_excel_folders    
         self.stock = stock #this allows qqq, spy, tqqq, spxl
@@ -83,7 +84,8 @@ class Assumptions():
 
         self.vix_velocity_upper_threshold = vix_velocity_upper_threshold
         self.vix_velocity_lower_threshold = vix_velocity_lower_threshold
-        self.days_for_vix_velocity = days_for_vix_velocity 
+        self.days_for_vix_velocity = days_for_vix_velocity
+        self.days_out_after_significant_vix_velocity_move = days_out_after_significant_vix_velocity_move
 
         self.days_for_moving_avg_stock_velocity = days_for_moving_avg_stock_velocity
         self.moving_avg_stock_velocity_threshold = moving_avg_stock_velocity_threshold 
@@ -180,6 +182,7 @@ class LoadStock:
 class Metrics:
 
     def __init__(self, Assumptions, stock):
+        self.LoadStock = LoadStock()
         self.vix = self.GetVixData().load_vix_data(Assumptions)
         self.moving_average_by_day_of_stock_price_long = self.calc_moving_avg_of_stock_price_by_day(stock, Assumptions.days_for_moving_average_long)
         self.moving_average_by_day_of_stock_price_short = self.calc_moving_avg_of_stock_price_by_day(stock, Assumptions.days_for_moving_average_short)
@@ -267,13 +270,12 @@ class Metrics:
                         rs = adjusted_avg_gain/float(adjusted_avg_loss)
                         rsi = 100 - (100/(1+rs))
                 except:
-                    print(traceback.format_exc())
                     self.rsi_by_day[date] = None
                     
                 if last_price is not False:
                     stock_change_values.append(stock[date]['close'] - last_price)
 
-                last_price = stock[date]['close']
+                last_price = round(stock[date]['close'], 2)
                 days += 1
             return self.rsi_by_day
 
@@ -380,8 +382,7 @@ class Metrics:
             if last_price is not False:
                 sum_of_stock_velocity_values = 0
                 if days >= Assumptions.days_for_moving_avg_stock_velocity:
-                    for velocity in stock_velocity_values[-1*Assumptions.days_for_moving_avg_stock_velocity:]:
-                        sum_of_stock_velocity_values += velocity
+                    sum_of_stock_velocity_values =  sum(stock_velocity_values[-1*Assumptions.days_for_moving_avg_stock_velocity:])
                     moving_average_stock_velocity_by_day[date] = sum_of_stock_velocity_values/Assumptions.days_for_moving_avg_stock_velocity
                 else:
                     moving_average_stock_velocity_by_day[date] = None
@@ -397,8 +398,7 @@ class Metrics:
         for date in stock:
             sum_of_stock_values = 0
             if days >= days_for_moving_average:
-                for close_price in stock_values[-1*days_for_moving_average:]:
-                    sum_of_stock_values += close_price
+                sum_of_stock_values = sum(stock_values[-1*days_for_moving_average:])
                 moving_average_by_day[date] = sum_of_stock_values/days_for_moving_average
             else:
                 moving_average_by_day[date] = None
@@ -453,13 +453,23 @@ class Triggers:
         return vix_position_below_treshold
 
     def check_whether_vix_velocity_is_between_thresholds(self, Assumptions, Metrics):
+        days_out = False
         vix_velocity_between_thresholds = {}
         for date in Metrics.vix_velocity_moving_average_by_day:
             if Metrics.vix_velocity_moving_average_by_day[date] != None:
                 vix_velocity_between_thresholds[date] = {'open': False}
-                
+
+                if days_out >= Assumptions.days_out_after_significant_vix_velocity_move:
+                    days_out = False
+
                 if Assumptions.vix_velocity_lower_threshold <= Metrics.vix_velocity_moving_average_by_day[date] <= Assumptions.vix_velocity_upper_threshold:
-                    vix_velocity_between_thresholds[date]['open'] = True
+                    if days_out == False:
+                        vix_velocity_between_thresholds[date]['open'] = True
+                    else:
+                        days_out += 1
+                else:
+                    days_out = 1
+ 
                 
         return vix_velocity_between_thresholds
 
@@ -569,7 +579,6 @@ class Combos:
 
 
                 if Triggers.vix_position_below_high_treshold[date]['open'] == True: #VIX IS BELOW HIGH
-
                     if (Triggers.vix_velocity_between_thresholds[date]['open'] == True
                         and Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True
                         and Triggers.rsi_below_high_sell_threshold[date]['open'] == True):
@@ -578,7 +587,6 @@ class Combos:
 
                         
                 elif Triggers.vix_position_below_super_high_threshold[date]['open'] == True: #VIX IS BETWEEN HIGH AND SUPER HIGH
-
                     if (Triggers.stock_price_above_moving_average_long[date]['open'] == True 
                         and Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True 
                         and Triggers.difference_between_long_and_short_moving_avg_above_threshold[date]['open'] == True 
@@ -742,9 +750,12 @@ class Combos:
                 
                 combo_2[date] = {'open': False}
                 
-                if (Triggers.vix_position_below_high_treshold[date]['open'] == True or #VIX BELOW HIGH
-                    (Triggers.stock_price_above_moving_average_long[date]['open'] == True and
-                     Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True)):
+                if Triggers.vix_position_below_high_treshold[date]['open'] == True: #VIX BELOW HIGH
+                    
+                    combo_2[date]['open'] = True
+
+                elif (Triggers.stock_price_above_moving_average_long[date]['open'] == True and #VIX ABOVE HIGH
+                      Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True):
                     
                     combo_2[date]['open'] = True
                     
@@ -760,10 +771,13 @@ class Combos:
                 if Triggers.vix_position_below_high_treshold[date]['open'] == True: #VIX BELOW HIGH
                     combo_1[date]['open'] = True
                     
-                if Triggers.stock_price_above_moving_average_long[date]['open'] == True:
+                elif Triggers.stock_price_above_moving_average_long[date]['open'] == True: #VIX ABOVE HIGH
                     combo_1[date]['open'] = True
                     
         return combo_1
+
+
+    
 
 #######################
 #
@@ -904,8 +918,8 @@ def write_view_strategy_alongside_relevant_metrics_by_day_to_excel(data_for_exce
                               'values': '=\'' + data_title + "\'!$E2:$E" + str(len(data_for_excel[data_title]))})
             
             chart.add_series({'name': '=\'' + data_title + "\'!$G$1",
-                  'categories': '=\'' + data_title + "\'!$A2:$A" + str(len(data_for_excel[data_title])),
-                  'values': '=\'' + data_title + "\'!$G2:$G" + str(len(data_for_excel[data_title]))})
+                              'categories': '=\'' + data_title + "\'!$A2:$A" + str(len(data_for_excel[data_title])),
+                              'values': '=\'' + data_title + "\'!$G2:$G" + str(len(data_for_excel[data_title]))})
             
             chart.set_title({'name': "Aggregate Returns Leveraged v. Non Leveraged"})
             worksheet.insert_chart('N2', chart, {'x_offset': 25, 'y_offset': 10})
@@ -921,32 +935,32 @@ def write_view_strategy_alongside_relevant_metrics_by_day_to_excel(data_for_exce
 class Returns:
 
     def __init__(self, stock, Triggers, Assumptions, Combos):
-        self.buy_and_hold_strategy = self.Single_Strategy_Returns(stock, Triggers.buy_and_hold, Assumptions)
-        self.vix_position_high_strategy = self.Single_Strategy_Returns(stock, Triggers.vix_position_below_high_treshold, Assumptions)
-        self.vix_position_low_strategy = self.Single_Strategy_Returns(stock, Triggers.vix_position_below_low_threshold, Assumptions)
-        self.vix_position_super_high_strategy = self.Single_Strategy_Returns(stock, Triggers.vix_position_below_super_high_threshold, Assumptions)
-        self.vix_position_astronomically_high_strategy = self.Single_Strategy_Returns(stock, Triggers.vix_position_below_astronomically_high_threshold, Assumptions)
-        self.stock_price_moving_average_long_strategy = self.Single_Strategy_Returns(stock, Triggers.stock_price_above_moving_average_long, Assumptions)
-        self.stock_price_moving_average_short_strategy = self.Single_Strategy_Returns(stock, Triggers.stock_price_above_moving_average_short, Assumptions)
-        self.stock_velocity_moving_average_strategy = self.Single_Strategy_Returns(stock, Triggers.moving_avg_stock_velocity_above_threshold, Assumptions)
-        self.difference_between_long_and_short_stock_moving_avg_strategy = self.Single_Strategy_Returns(stock, Triggers.difference_between_long_and_short_moving_avg_above_threshold, Assumptions)
-        self.vix_velocity_strategy = self.Single_Strategy_Returns(stock, Triggers.vix_velocity_between_thresholds, Assumptions)
-        self.percent_days_above_moving_average_strategy = self.Single_Strategy_Returns(stock, Triggers.percent_of_days_above_moving_average_above_threshold, Assumptions)
-        self.rsi_is_below_high_sell_threshold = self.Single_Strategy_Returns(stock, Triggers.rsi_below_high_sell_threshold, Assumptions)
-        self.rsi_is_below_low_sell_threshold = self.Single_Strategy_Returns(stock, Triggers.rsi_below_low_sell_threshold, Assumptions)
-        self.velocity_of_difference_between_long_and_short_below_threshold = self.Single_Strategy_Returns(stock, Triggers.velocity_of_difference_between_long_and_short_below_threshold, Assumptions)
+        self.buy_and_hold_strategy = self.SingleStrategyReturns(stock, Triggers.buy_and_hold, Assumptions)
+        self.vix_position_high_strategy = self.SingleStrategyReturns(stock, Triggers.vix_position_below_high_treshold, Assumptions)
+        self.vix_position_low_strategy = self.SingleStrategyReturns(stock, Triggers.vix_position_below_low_threshold, Assumptions)
+        self.vix_position_super_high_strategy = self.SingleStrategyReturns(stock, Triggers.vix_position_below_super_high_threshold, Assumptions)
+        self.vix_position_astronomically_high_strategy = self.SingleStrategyReturns(stock, Triggers.vix_position_below_astronomically_high_threshold, Assumptions)
+        self.stock_price_moving_average_long_strategy = self.SingleStrategyReturns(stock, Triggers.stock_price_above_moving_average_long, Assumptions)
+        self.stock_price_moving_average_short_strategy = self.SingleStrategyReturns(stock, Triggers.stock_price_above_moving_average_short, Assumptions)
+        self.stock_velocity_moving_average_strategy = self.SingleStrategyReturns(stock, Triggers.moving_avg_stock_velocity_above_threshold, Assumptions)
+        self.difference_between_long_and_short_stock_moving_avg_strategy = self.SingleStrategyReturns(stock, Triggers.difference_between_long_and_short_moving_avg_above_threshold, Assumptions)
+        self.vix_velocity_strategy = self.SingleStrategyReturns(stock, Triggers.vix_velocity_between_thresholds, Assumptions)
+        self.percent_days_above_moving_average_strategy = self.SingleStrategyReturns(stock, Triggers.percent_of_days_above_moving_average_above_threshold, Assumptions)
+        self.rsi_is_below_high_sell_threshold = self.SingleStrategyReturns(stock, Triggers.rsi_below_high_sell_threshold, Assumptions)
+        self.rsi_is_below_low_sell_threshold = self.SingleStrategyReturns(stock, Triggers.rsi_below_low_sell_threshold, Assumptions)
+        self.velocity_of_difference_between_long_and_short_below_threshold = self.SingleStrategyReturns(stock, Triggers.velocity_of_difference_between_long_and_short_below_threshold, Assumptions)
         
-        self.combo_1 = self.Single_Strategy_Returns(stock, Combos.combo_1, Assumptions)
-        self.combo_2 = self.Single_Strategy_Returns(stock, Combos.combo_2, Assumptions)
-        self.combo_3 = self.Single_Strategy_Returns(stock, Combos.combo_3, Assumptions)
-        self.combo_4 = self.Single_Strategy_Returns(stock, Combos.combo_4, Assumptions)
-        self.combo_5 = self.Single_Strategy_Returns(stock, Combos.combo_5, Assumptions)
-        self.combo_6 = self.Single_Strategy_Returns(stock, Combos.combo_6, Assumptions)
-        self.combo_7 = self.Single_Strategy_Returns(stock, Combos.combo_7, Assumptions)
-        self.combo_8 = self.Single_Strategy_Returns(stock, Combos.combo_8, Assumptions)
-        self.combo_9 = self.Single_Strategy_Returns(stock, Combos.combo_9, Assumptions)
+        self.combo_1 = self.SingleStrategyReturns(stock, Combos.combo_1, Assumptions)
+        self.combo_2 = self.SingleStrategyReturns(stock, Combos.combo_2, Assumptions)
+        self.combo_3 = self.SingleStrategyReturns(stock, Combos.combo_3, Assumptions)
+        self.combo_4 = self.SingleStrategyReturns(stock, Combos.combo_4, Assumptions)
+        self.combo_5 = self.SingleStrategyReturns(stock, Combos.combo_5, Assumptions)
+        self.combo_6 = self.SingleStrategyReturns(stock, Combos.combo_6, Assumptions)
+        self.combo_7 = self.SingleStrategyReturns(stock, Combos.combo_7, Assumptions)
+        self.combo_8 = self.SingleStrategyReturns(stock, Combos.combo_8, Assumptions)
+        self.combo_9 = self.SingleStrategyReturns(stock, Combos.combo_9, Assumptions)
 
-    class Single_Strategy_Returns:
+    class SingleStrategyReturns:
 
         def __init__(self, stock, triggers_by_day, Assumptions):
             self.leverage_multiple = Assumptions.leverage_multiple
@@ -962,7 +976,7 @@ class Returns:
             currently_holding_stock = False
             
             for date in triggers_by_day: #this assumes all buy and sells orders are triggered at open
-                
+                buy_and_sell_orders_by_day[date] = None
                 if date in stock:
                         
                     if triggers_by_day[date]['open']:
@@ -977,18 +991,28 @@ class Returns:
                         currently_holding_stock = False
 
             return buy_and_sell_orders_by_day
-
-        def add_running_tally_by_day_open_data(self, stock, date):
-            
+        
+        def calculate_current_return(self, current_price, last_price):
+            running_tally = self.running_tally * (1+ ((current_price - last_price)/last_price))
+            running_tally_3x = self.running_tally_3x * (1+ (((current_price - last_price)/last_price) * self.leverage_multiple))
+            return running_tally, running_tally_3x
+        
+        def add_running_tally_by_day_open_data(self, stock, date, last_price):
+            try: #if last price is False, we have not made any returns yet
+                open_running_tally, open_running_tally_3x = self.calculate_current_return(stock[date]['open'], last_price)
+            except:
+                open_running_tally = 1
+                open_running_tally_3x = 1
+                
             self.running_tally_by_day[date] = {'month': stock[date]['month'],
                                                'day': stock[date]['day'],
                                                'year': stock[date]['year'],
-                                               'open_running_tally': self.running_tally}
-            
+                                               'open_running_tally': open_running_tally}
+
             self.running_tally_by_day_3x[date] = {'month': stock[date]['month'],
                                                   'day': stock[date]['day'],
                                                   'year': stock[date]['year'],
-                                                  'open_running_tally': self.running_tally_3x}
+                                                  'open_running_tally': open_running_tally_3x}
 
         def add_running_tally_by_day_close_data(self, date, buy_and_sell_orders_by_day):
             
@@ -997,19 +1021,14 @@ class Returns:
             
             self.running_tally_by_day_3x[date]['close_running_tally'] = self.running_tally_3x
             self.running_tally_by_day_3x[date]['buy_sell_order'] = buy_and_sell_orders_by_day[date]
-        
-        def calculate_current_return(self, current_price, last_price):
-            running_tally = self.running_tally * (1+ ((current_price - last_price)/last_price))
-            running_tally_3x = self.running_tally_3x * (1+ (((current_price - last_price)/last_price) * self.leverage_multiple))
-            return running_tally, running_tally_3x
 
         def calculate_return_of_stock(self, stock, triggers_by_day):
             buy_and_sell_orders_by_day = self.create_buy_sell_orders(triggers_by_day, stock)
 
             last_price = False 
             for date in buy_and_sell_orders_by_day:
-                if date in stock:
-                    self.add_running_tally_by_day_open_data(stock, date)
+                if date in stock and buy_and_sell_orders_by_day[date] != None:
+                    self.add_running_tally_by_day_open_data(stock, date, last_price)
 
                     if buy_and_sell_orders_by_day[date] == "buy":
                         last_price = stock[date]['open']
@@ -1023,14 +1042,16 @@ class Returns:
                         
                     self.add_running_tally_by_day_close_data(date, buy_and_sell_orders_by_day)
                         
-            return self.running_tally_by_day, self.running_tally_by_day_3x  
+            return self.running_tally_by_day, self.running_tally_by_day_3x
+
+        
 #######################
 #
 # CALC DATA
 #
 #######################
 
-class CalcData:
+class CalcReturnsBetweenDateRanges:
     
     def __init__(self, start_date, end_date, stock, Assumptions, Metrics):
         if start_date != None and end_date != None:
@@ -1082,7 +1103,7 @@ class GenerateReports:
         data_for_excel = {}
 
         for date_range in self.date_ranges: #for each date range compile list of excel data separately
-            stock, Triggers, Combos, Returns = CalcData(date_range['start_date'], date_range['end_date'], self.stock, self.Assumptions, self.Metrics).calc_triggers_combos_and_returns()
+            stock, Triggers, Combos, Returns = CalcReturnsBetweenDateRanges(date_range['start_date'], date_range['end_date'], self.stock, self.Assumptions, self.Metrics).calc_triggers_combos_and_returns()
             data = create_view_strategy_alongside_relevant_metrics_by_day_data(self.strategy_to_see,
                                                             stock,
                                                             self.Assumptions,
@@ -1094,7 +1115,7 @@ class GenerateReports:
         empty = write_view_strategy_alongside_relevant_metrics_by_day_to_excel(data_for_excel, self.Assumptions) #write lists to excel
 
     def print_report_to_IDE(self, start_date, end_date):
-        stock, Triggers, Combos, Returns = CalcData(start_date, end_date, self.stock, self.Assumptions, self.Metrics).calc_triggers_combos_and_returns()
+        stock, Triggers, Combos, Returns = CalcReturnsBetweenDateRanges(start_date, end_date, self.stock, self.Assumptions, self.Metrics).calc_triggers_combos_and_returns()
         for attribute in [a for a in dir(Returns) if not a.startswith('__')]:
             print(attribute)
 
@@ -1103,14 +1124,199 @@ class GenerateReports:
                 running_tally_by_day = strategy_returns.running_tally_by_day
                 running_tally_by_day_3x = strategy_returns.running_tally_by_day_3x
 
-                print("No Leverage: " + str(get_last_item_in_dictionary_of_dictionaries(running_tally_by_day, 'close_running_tally')))
-                print("With Leverage: " + str(get_last_item_in_dictionary_of_dictionaries(running_tally_by_day_3x, 'close_running_tally')))
+                print("No Leverage: " + str(get_last_item_in_dictionary_of_dictionaries(running_tally_by_day, 'close_running_tally'))+"x")
+                print("With Leverage: " + str(get_last_item_in_dictionary_of_dictionaries(running_tally_by_day_3x, 'close_running_tally'))+"x")
 
             except:
                 print("No Leverage: 1")
                 print("With Leverage: 1")
             print()
             print()
+
+#######################
+#
+# EXPERIMENTS
+#
+#######################
+
+class Experiments:
+    
+    def __init__(self, Assumptions, start_date = None, end_date = None):
+        self.start_date = start_date
+        self.end_date = end_date
+        self.Assumptions = Assumptions
+        self.stock = LoadStock().load_stock_data(self.Assumptions)
+        self.Metrics = Metrics(self.Assumptions, self.stock)
+        self.stock, self.Triggers, self.Combos, self.Returns = CalcReturnsBetweenDateRanges(self.start_date, self.end_date, self.stock, self.Assumptions, self.Metrics).calc_triggers_combos_and_returns()
+        self.running_tally = 1
+        self.last_price = 1
+        self.percent_change = 0
+        self.last_date = 0
+        self.buy = False
+
+    def calc_running_tally(self):
+        self.running_tally = self.running_tally * (1+self.percent_change)
+
+    def calc_percent_change(self, date):
+        current_price = self.Returns.buy_and_hold_strategy.running_tally_by_day_3x[date]['open_running_tally']
+        self.percent_change = (current_price - self.last_price)/self.last_price
+
+    def update_last_price(self, date):
+        self.last_price = self.Returns.buy_and_hold_strategy.running_tally_by_day_3x[date]['open_running_tally']
+
+    def print_results(self):
+        print(self.last_date) #the date when the condition was met
+        print(self.percent_change * 100) #the change between when the condition was met and the next open
+        print(self.running_tally)
+        print()
+        print()
+
+    def sell_stock_and_calculate_returns(self, date):
+        if self.buy == True: #this is the next morning after the previous buy (the buy happens below)
+            self.calc_percent_change(date)
+            self.calc_running_tally()
+            self.buy = False
+
+    def experiment_combo_8_betwee_high_and_super_high_add_vix_velocity(self):
+
+        #adding vix velocity to vix between high and super high
+        #but only if you add a lower threshold
+        #vix_velocity_upper_threshold = 85
+        #Experiments(Assumptions(vix_velocity_upper_threshold = 85)).experiment_combo_8_add_vix_velocity()
+        
+        for date in self.Returns.buy_and_hold_strategy.running_tally_by_day_3x:
+
+            self.sell_stock_and_calculate_returns(date)  
+            
+            try: 
+
+                
+                if (self.Triggers.vix_position_below_super_high_threshold[date]['open'] == True
+                    and self.Triggers.vix_position_below_high_treshold[date]['open'] == False): 
+
+                    if (self.Triggers.stock_price_above_moving_average_long[date]['open'] == True 
+                        and self.Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True 
+                        and self.Triggers.difference_between_long_and_short_moving_avg_above_threshold[date]['open'] == True 
+                        and self.Triggers.rsi_below_high_sell_threshold[date]['open'] == True
+                        and self.Triggers.vix_velocity_between_thresholds[date]['open'] == True): #this line is new, but only helps with vix_velocity_upper_threshold = 85 
+
+                        self.buy = True
+            except:
+                pass
+            
+            self.update_last_price(date) 
+            self.last_date = date
+        print(self.running_tally)
+
+    def experiment_combo_8_between_super_high_and_astronomical_add_vix_velocity_and_increase_astronimical_limit(self):
+
+        #increase astronomical vix threshold to 50
+        #add vix_velocity but only if you decrease upper limit
+        #vix_velocity_upper_threshold = 85
+        #Experiments = Experiments(Assumptions(vix_astronomically_high_threshold = 50, vix_velocity_upper_threshold = 85)).experiment_combo_8_between_super_high_and_astronomical_add_vix_velocity_and_increase_astronimical_limit()
+        
+        for date in self.Returns.buy_and_hold_strategy.running_tally_by_day_3x:
+
+            self.sell_stock_and_calculate_returns(date)  
+            
+            try: 
+
+                
+                if (self.Triggers.vix_position_below_super_high_threshold[date]['open'] == True
+                    and self.Triggers.vix_position_below_high_treshold[date]['open'] == False): 
+
+                    if (self.Triggers.stock_price_above_moving_average_long[date]['open'] == True 
+                        and self.Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True 
+                        and self.Triggers.difference_between_long_and_short_moving_avg_above_threshold[date]['open'] == True 
+                        and self.Triggers.rsi_below_high_sell_threshold[date]['open'] == True
+                        and self.Triggers.vix_velocity_between_thresholds[date]['open'] == True): #this line is new, but only helps with vix_velocity_upper_threshold = 85 
+
+                        self.buy = True
+            except:
+                pass
+            
+            self.update_last_price(date) 
+            self.last_date = date
+        print(self.running_tally)
+
+    def experiment_vix_above_40_and_vix_velocity_results_in_earnings(self):
+
+        #you can make 27 percent if you are in the market when the vix is above 40
+        #so long as you exit the market for 2 days every time the vix velocity thresholds are met
+        #Experiments = Experiments(Assumptions(vix_super_high_threshold = 40, days_out_after_significant_vix_velocity_move = 2)).experiment_vix_above_40_and_vix_velocity_results_in_earnings()
+        
+        for date in self.Returns.buy_and_hold_strategy.running_tally_by_day_3x:
+
+            self.sell_stock_and_calculate_returns(date)  
+            
+            try: 
+
+                
+                if self.Triggers.vix_position_below_super_high_threshold[date]['open'] == False: #VIX IS ABOVE SUPER HIGH
+
+                    if self.Triggers.vix_velocity_between_thresholds[date]['open'] == True:
+                        
+                        self.buy = True
+            except:
+                pass
+            
+            self.update_last_price(date) 
+            self.last_date = date
+        print(self.running_tally)
+
+    def experiment_vix_above_70(self):
+
+        #you can make 36 percent if you are in the market when the vix is above 70
+        #Experiments = Experiments(Assumptions(vix_super_high_threshold = 70, days_out_after_significant_vix_velocity_move = 0)).experiment()
+        
+        for date in self.Returns.buy_and_hold_strategy.running_tally_by_day_3x:
+
+            self.sell_stock_and_calculate_returns(date)  
+            
+            try: 
+
+                
+                if self.Triggers.vix_position_below_super_high_threshold[date]['open'] == False: #VIX IS ABOVE SUPER HIGH
+                        
+                        self.buy = True
+            except:
+                pass
+            
+            self.update_last_price(date) 
+            self.last_date = date
+        print(self.running_tally)
+        
+    def experiment(self):
+        #this assumes we buy at open on the day the conditions are met and sell the next open
+        for date in self.Returns.buy_and_hold_strategy.running_tally_by_day_3x:
+
+            self.sell_stock_and_calculate_returns(date) #this is the next morning after the previous buy (the buy happens below) 
+            #self.print_results() #uncomment this if you want to see day by day results printed to the shell
+            
+            try: #if date is not in one of the triggers, you will get an error.
+
+                
+                if self.Triggers.vix_position_below_super_high_threshold[date]['open'] == True: #VIX IS BETWEEN HIGH AND SUPER HIGH
+                    if self.Triggers.vix_position_below_high_treshold[date]['open'] == False:
+                        if (self.Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True
+                            and self.Triggers.rsi_below_high_sell_threshold[date]['open'] == True):
+
+                                ###############################################
+                                # DO NOT ACCIDENTALLY DELETE THE FOLLOWING LINE
+                                ###############################################
+                                self.buy = True
+            except:
+                #print(traceback.format_exc()) #if you get a result that is extreme, uncomment this line and ensure the errors are only related to date not being in triggers
+                pass
+            
+            self.update_last_price(date) #open price
+            self.last_date = date
+        print(self.running_tally)
+
+            
+#Experiments = Experiments(Assumptions(vix_super_high_threshold = 50, moving_avg_stock_velocity_threshold=0)).experiment()
+
+
 
 
 #######################
