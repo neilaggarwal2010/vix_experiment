@@ -6,6 +6,11 @@ import xlrd
 import xlsxwriter
 from dateutil.relativedelta import relativedelta
 from scipy import stats
+import requests
+import json
+import dateutil.parser
+import pandas
+import pandas_datareader.data as web
 
 #Four Classes/Sections: Assumptions, Metrics, Triggers, Combos, Returns
 #Assumptions are the thresholds and values we use as the foundation of our strategies.  Simplest Example, we set the vix threshold to 18
@@ -32,20 +37,35 @@ from scipy import stats
 class Assumptions():
 
     def __init__(self,
+                 ignore_dividends = True,
+                 excel_or_api = "alphavantage", #do you get stock data from a api or excel (e.g.market_stack, tiingo, alphavantage, excel)?
+                                                         #Note - VIX defaults to marketstack, but will do excel if marketstack fails
+                 market_stack_api_key = "bc68167928271e070e1fd49345cdfd6d", #make this an empty string before sharing with others
+                 tiingo_api_key = "ae7d7add411168cb89685d7f4256d9bf0ce2c692",
+                 alphavantage_api_key = "SCTCBSEBENCKWVM9",
                  location_of_excel_folders = "./vix_analysis/",
+                 
                  stock = "QQQ",
                  leverage_multiple = 3,
 
+                 rolling_stop_loss_threshold = 1.7, #percent, will sell intraday if stock loses more than amount.  Will always be treated as negative number
+                 days_out_after_rolling_stop_loss_threshold_met = 1,
+
                  vix_low_threshold = 14,
                  vix_high_threshold = 18, 
-                 vix_super_high_threshold = 30, #will buy when <= threshold.  we have multiple thresholds to allow for different levels of scrutiny depending on vix level.
+                 vix_super_high_threshold = 30, #will buy when <= threshold.  we have multiple thresholds to allow for different levels of
+                                                #scrutiny depending on vix level.
                  vix_astronomically_high_threshold = 40,
                  
                  days_for_moving_average_long = 50, 
                  days_for_moving_average_short = 10,
                  difference_between_long_and_short_moving_average_threshold = -3, #will buy when >= threshold
 
-                 velocity_of_difference_between_long_and_short_moving_averages_threshold = 20, #percentiles, lower percentiles indicate short is quickly getting larger than long, buy when above threshold
+                 velocity_of_difference_between_long_and_short_moving_averages_threshold = 20, #percentiles, lower percentiles indicate short is quickly
+                                                                                               #getting larger than long, buy when above threshold
+
+                 moving_average_of_velocity_of_difference_between_long_and_short_moving_avg_threshold = 0,
+                 moving_average_of_velocity_of_difference_between_long_and_short_moving_avg_days = 5,
 
                  days_for_percent_above_moving_average = 50,#number of days for moving average (which is the underlying metric for this calc)
                  percent_above_moving_average_threshold = 17,#any number here is a percent, .02 is .02%, will buy when x% of previous days was above moving avg
@@ -60,13 +80,21 @@ class Assumptions():
                  
                  days_for_avg_negative = 20,
 
-                 days_for_rsi_calculation = 50, #RSI attempts to calculate when the market is overbought or oversold, high values = overbought scale of 1-100
+                 days_for_rsi_calculation = 50, #RSI attempts to calculate when the market is overbought or oversold, high values = overbought, scale of 1-100
                  rsi_high_sell_threshold = 60,
                  rsi_low_sell_threshold = 50,):
-        
+
+        self.ignore_dividends = ignore_dividends
+        self.tiingo_api_key = tiingo_api_key
+        self.alphavantage_api_key = alphavantage_api_key
+        self.excel_or_api = excel_or_api
+        self.market_stack_api_key = market_stack_api_key
         self.location_of_excel_folders = location_of_excel_folders    
         self.stock = stock #this allows qqq, spy, tqqq, spxl
         self.leverage_multiple = leverage_multiple
+
+        self.rolling_stop_loss_threshold = abs(rolling_stop_loss_threshold)
+        self.days_out_after_rolling_stop_loss_threshold_met = days_out_after_rolling_stop_loss_threshold_met
 
         self.vix_low_threshold = vix_low_threshold
         self.vix_high_threshold = vix_high_threshold
@@ -79,6 +107,9 @@ class Assumptions():
 
         self.velocity_of_difference_between_long_and_short_moving_averages_threshold = velocity_of_difference_between_long_and_short_moving_averages_threshold
 
+        self.moving_average_of_velocity_of_difference_between_long_and_short_moving_avg_threshold = moving_average_of_velocity_of_difference_between_long_and_short_moving_avg_threshold
+        self.moving_average_of_velocity_of_difference_between_long_and_short_moving_avg_days = moving_average_of_velocity_of_difference_between_long_and_short_moving_avg_days
+        
         self.days_for_percent_above_moving_average = days_for_percent_above_moving_average
         self.percent_above_moving_average_threshold = percent_above_moving_average_threshold 
 
@@ -119,58 +150,335 @@ def get_last_item_in_dictionary_of_dictionaries(dictionary_of_dictionaries, key_
 
 class LoadStock:
 
-    def __init__(self):
-        self.stock = {}
+    class GeneralFunctions:
+        
+        def build_dictionary_of_single_day_data(self, year,
+                                                month,
+                                                day,
+                                                timestamp,
+                                                human_readable_date,
+                                                stock_open,
+                                                stock_close,
+                                                stock_low = None,
+                                                raw_open = None,
+                                                raw_close = None,
+                                                raw_low = None):
+            if stock_open != "n/a":
+                single_day_data = {'year': year,
+                                   'month': month,
+                                   'day': day,
+                                   'timestamp': timestamp,
+                                   'human_readable_date': human_readable_date,
+                                   'open': stock_open,
+                                   'close': stock_close,
+                                   'low': stock_low,
+                                   'raw_open': raw_open,
+                                   'raw_close': raw_close,
+                                   'raw_low': raw_low,
+                                   }
+                return single_day_data
+            return None
+        
+        def extract_date_information_from_human_readable_date_string(self, date):
+            date = dateutil.parser.parse(str(date))
+            year = int(date.strftime("%Y"))
+            month = int(date.strftime("%m"))
+            day = int(date.strftime("%d"))
+            human_readable_date = str(year) + "-" + str(month) + "-" +  str(day)
+            timestamp = time.mktime(datetime.datetime.strptime(str(year) + "-" + str(date.strftime("%m")) + "-" +  str(date.strftime("%d")), "%Y-%m-%d").timetuple())
+            return human_readable_date, year, month, day, timestamp
 
-    def get_sheet_from_excel(self, Assumptions, file_name):
-        book = open_workbook(Assumptions.location_of_excel_folders + file_name)
-        sheet = book.sheet_by_index(0)
-        return book, sheet
+        def create_time_sorted_dictionary(self, data_list):
+            temp_stock_data = {}
+            data_list = sorted(data_list, key= lambda x: x['timestamp'])
+            for ele in data_list:
+                temp_stock_data[ele['human_readable_date']] = ele
+            return temp_stock_data
+
+    class AdjustStockPrice:
+        
+        def calculate_cash_dividend_adjustment_factor_by_date(self, stock, dividends):
+            #See: https://blog.quandl.com/guide-to-stock-price-calculation
+            adjustment_factor_by_date = {}
+            aggregate_adjustment_factor = 1
+            dividend = 0
+            for date, data in sorted(dividends.items(), key=lambda x:x[1]['timestamp'], reverse=True):
+                
+                #adjustment factor is applied to previous day, this is at the top to implement that requirement (remember, we are looping through a reversed dictionary)
+                adjustment = (stock[date]['raw_close'] - dividend)/stock[date]['raw_close']
+                aggregate_adjustment_factor = adjustment * aggregate_adjustment_factor
+                adjustment_factor_by_date[date] = aggregate_adjustment_factor
+
+                dividend = data['value']
+                
+            return adjustment_factor_by_date
+
+        def calculate_split_adjustment_factor_by_date(self, stock, splits):
+            #See: https://blog.quandl.com/guide-to-stock-price-calculation
+            adjustment_factor_by_date = {}
+            aggregate_adjustment_factor = 1
+            split = 1
+            for date, data in sorted(splits.items(), key=lambda x:x[1]['timestamp'], reverse=True):
+                
+                #adjustment factor is applied to previous day, this is at the top to implement that requirement (remember, we are looping through a reversed dictionary)
+                adjustment = 1/split
+                aggregate_adjustment_factor = adjustment * aggregate_adjustment_factor
+                adjustment_factor_by_date[date] = aggregate_adjustment_factor
+                
+                split = data['value']
+                
+            return adjustment_factor_by_date
+
+        def calculate_adjusted_value_by_date(self, stock, aggregate_splits, aggregate_dividends, key):
+            for date in stock:
+                aggregate_split_adjustment_factor = aggregate_splits[date]
+                aggregate_dividend_adjustment_factor = aggregate_dividends[date]
+
+                item = stock[date]["raw_" + key]
+
+                adjusted_value = item * aggregate_split_adjustment_factor * aggregate_dividend_adjustment_factor 
+
+                stock[date][key] = adjusted_value
+                
+            return stock
+
+        def alter_adjusted_price_to_ignore_dividends(self, stock, aggregate_dividends, key):
+            try: #if key is "low", not all apis provide low (ex. we did not include low in the excel sheets in the beginning)
+                for date in stock:
+                    stock[date][key] = stock[date][key]/aggregate_dividends[date]
+            except:
+                pass
+            return stock
+        
+    class FromExcel:
+
+        def __init__(self):
+            self.stock = {}
+        
+        def get_sheet_from_excel(self, Assumptions, file_name):
+            book = open_workbook(Assumptions.location_of_excel_folders + file_name)
+            sheet = book.sheet_by_index(0)
+            return book, sheet
+
+        def convert_excel_date_to_component_parts(self, book, excel_date):
+            book_datemode = book.datemode
+            year, month, day, hour, minute, second = xlrd.xldate_as_tuple(excel_date, book.datemode)
+            timestamp = time.mktime(datetime.datetime.strptime(str(year) + "-" + str(month) + "-" +  str(day), "%Y-%m-%d").timetuple())
+            human_readable_date = str(year) + "-" + str(month) + "-" +  str(day)
+            return year, month, day, hour, minute, second, human_readable_date, timestamp
+
+        def extract_one_row_of_stock_data(self, book, row):
+            stock_open = row[1].value
+            stock_close = row[2].value
+            excel_date = row[0].value
+            year, month, day, hour, minute, second, human_readable_date, timestamp = self.convert_excel_date_to_component_parts(book, excel_date)
+            return LoadStock().GeneralFunctions().build_dictionary_of_single_day_data(year, month, day, timestamp, human_readable_date, stock_open, stock_close)
+
+        def get_data(self, Assumptions):
+            book, sheet = self.get_sheet_from_excel(Assumptions, Assumptions.stock + ".xls")
+            counter = 0
+            for row in sheet:
+                if counter > 0:
+                    single_day_data = self.extract_one_row_of_stock_data(book, row)
+                    if single_day_data != None:
+                        self.stock[single_day_data['human_readable_date']] = single_day_data
+                counter += 1
+            return self.stock
+    
+    class FromMarketStack:
+
+        def __init__(self):
+            self.stock = {}
             
-    def convert_excel_date_to_component_parts(self, book, excel_date):
-        book_datemode = book.datemode
-        year, month, day, hour, minute, second = xlrd.xldate_as_tuple(excel_date, book.datemode)
-        timestamp = time.mktime(datetime.datetime.strptime(str(year) + "-" + str(month) + "-" +  str(day), "%Y-%m-%d").timetuple())
-        human_readable_date = str(year) + "-" + str(month) + "-" +  str(day)
-        return year, month, day, hour, minute, second, human_readable_date, timestamp
+        def extract_single_row_of_market_stack_data(self, row):
+            date = dateutil.parser.parse(row['date'])
+            year = int(date.strftime("%Y"))
+            month = int(date.strftime("%m"))
+            day = int(date.strftime("%d"))
+            human_readable_date = str(year) + "-" + str(month) + "-" +  str(day)
+            timestamp = time.mktime(datetime.datetime.strptime(str(year) + "-" + str(date.strftime("%m")) + "-" +  str(date.strftime("%d")), "%Y-%m-%d").timetuple())
 
-    def build_dictionary_of_single_day_data(self, year,
-                                            month,
-                                            day,
-                                            timestamp,
-                                            human_readable_date,
-                                            stock_open,
-                                            stock_close):
-        if stock_open != "n/a":
-            single_day_data = {'year': year,
-                               'month': month,
-                               'day': day,
-                               'timestamp': timestamp,
-                               'human_readable_date': human_readable_date,
-                               'open': stock_open,
-                               'close': stock_close
-                               }
-            return single_day_data
-        return None
+            if row['adj_open'] == None and row['close'] == row['adj_close']:
+                stock_open = row['open']
+            else:
+                stock_open = row['adj_open']
+                
+            stock_close = row['adj_close']            
+            row_dictionary = LoadStock().GeneralFunctions().build_dictionary_of_single_day_data(year,
+                                                                                                month,
+                                                                                                day,
+                                                                                                timestamp,
+                                                                                                human_readable_date,
+                                                                                                stock_open,
+                                                                                                stock_close,
+                                                                                                stock_low = row['adj_low'],
+                                                                                                raw_open = row['open'],
+                                                                                                raw_close = row['close'],
+                                                                                                raw_low = row['low'],)
+            return row_dictionary
+        
+        def get_data(self, Assumptions, ticker):
+            stock_list = []
+            number_of_records_per_api_call = 1000 #max is 1000 for market stack
+            params = {'access_key': Assumptions.market_stack_api_key,
+                      'limit': number_of_records_per_api_call}
+            offset = 0
+            total = 1
 
-    def extract_one_row_of_stock_data(self, book, row):
-        stock_open = row[1].value
-        stock_close = row[2].value
-        excel_date = row[0].value
-        year, month, day, hour, minute, second, human_readable_date, timestamp = self.convert_excel_date_to_component_parts(book, excel_date)
-        return self.build_dictionary_of_single_day_data(year, month, day, timestamp, human_readable_date, stock_open, stock_close)
+            while offset < total + number_of_records_per_api_call:
+                params['offset'] = offset
+                api_result = requests.get('https://api.marketstack.com/v1/tickers/'+ ticker + '/eod', params)
+                api_response = api_result.json()
 
-    def load_stock_data(self, Assumptions):
-        book, sheet = self.get_sheet_from_excel(Assumptions, Assumptions.stock + ".xls")
-        counter = 0
-        for row in sheet:
-            if counter > 0:
-                single_day_data = self.extract_one_row_of_stock_data(book, row)
-                if single_day_data != None:
-                    self.stock[single_day_data['human_readable_date']] = single_day_data
-            counter += 1
-        return self.stock
-   
+                offset = api_response['pagination']['offset']
+                total = api_response['pagination']['total']
+                
+                for stock_data in api_response['data']['eod']:
+                    stock_list.append(self.extract_single_row_of_market_stack_data(stock_data))
+                    
+                offset += number_of_records_per_api_call
+
+            prices_by_time = sorted(stock_list, key= lambda x: x['timestamp'])
+
+            self.stock = LoadStock().GeneralFunctions().create_time_sorted_dictionary(prices_by_time)
+
+            return self.stock
+            
+    class FromTiingo:
+        
+        def __init__(self):
+            self.stock = {}
+
+        def add_stock_data(self, data_type, api_data, key, human_readable_date):
+            if data_type == 'adjOpen':
+                self.stock[human_readable_date]['open'] = api_data[data_type][key]
+            elif data_type == 'adjClose':
+                self.stock[human_readable_date]['close'] = api_data[data_type][key]
+            elif data_type == 'adjLow':
+                self.stock[human_readable_date]['low'] = api_data[data_type][key]
+            elif data_type == 'open':
+                self.stock[human_readable_date]['raw_open'] = api_data[data_type][key]
+            elif data_type == 'close':
+                self.stock[human_readable_date]['raw_close'] = api_data[data_type][key]
+            elif data_type == 'low':
+                self.stock[human_readable_date]['raw_low'] = api_data[data_type][key]
+            return self.stock
+
+        def convert_tiingo_dictionary_into_date_value_dictionary(self, tiingo_dictionary):
+            data_list = []
+            for tiingo_date in tiingo_dictionary:
+                human_readable_date, year, month, day, timestamp = LoadStock().GeneralFunctions().extract_date_information_from_human_readable_date_string(tiingo_date[1])
+                data_list.append({'human_readable_date': human_readable_date, 'timestamp': timestamp, 'value': tiingo_dictionary[tiingo_date]})
+
+            dictionary = LoadStock().GeneralFunctions().create_time_sorted_dictionary(data_list)
+            return dictionary
+                                                                                                                                        
+        
+        def get_data(self, Assumptions, ticker):
+            ticker = Assumptions.stock
+            data = web.DataReader(ticker.upper(), 'tiingo', start="1899-1-1", api_key=Assumptions.tiingo_api_key)
+            api_format_data = data.to_dict()
+                
+            data_types = ['open', 'close', 'low', 'adjOpen', 'adjClose', 'adjLow']
+            for data_type in data_types:
+                for ele in api_format_data[data_type]:
+                    human_readable_date, year, month, day, timestamp = LoadStock().GeneralFunctions().extract_date_information_from_human_readable_date_string(ele[1])
+                    if human_readable_date not in self.stock:
+                        self.stock[human_readable_date] = {'year': year,
+                                                           'month': month,
+                                                           'day': day,
+                                                           'timestamp': timestamp,
+                                                           'human_readable_date': human_readable_date}
+                        
+                    self.stock = self.add_stock_data(data_type, api_format_data, ele, human_readable_date)
+
+            dividends = self.convert_tiingo_dictionary_into_date_value_dictionary(api_format_data['divCash'])
+            dividend_adjustment_factor_by_day = LoadStock().AdjustStockPrice().calculate_cash_dividend_adjustment_factor_by_date(self.stock, dividends)
+
+            splits = self.convert_tiingo_dictionary_into_date_value_dictionary(api_format_data['splitFactor'])
+            split_adjustment_factor_by_day = LoadStock().AdjustStockPrice().calculate_split_adjustment_factor_by_date(self.stock, splits)
+
+            if Assumptions.ignore_dividends:
+                self.stock = LoadStock().AdjustStockPrice().alter_adjusted_price_to_ignore_dividends(self.stock, dividend_adjustment_factor_by_day, "close")
+                self.stock = LoadStock().AdjustStockPrice().alter_adjusted_price_to_ignore_dividends(self.stock, dividend_adjustment_factor_by_day, "open")
+                self.stock = LoadStock().AdjustStockPrice().alter_adjusted_price_to_ignore_dividends(self.stock, dividend_adjustment_factor_by_day, "low")
+            
+            return self.stock
+
+    class FromAlphaVantage:
+        
+        def __init__(self):
+            self.stock = {}
+
+        
+        def get_data(self, Assumptions, ticker):
+            url = "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol=%s&apikey=%s&outputsize=full"%(ticker, Assumptions.alphavantage_api_key,)
+
+            json_response = requests.get(url).json()
+            data = json_response['Time Series (Daily)']
+
+            prices_by_time = []
+            dividends = []
+            splits = []
+            for date in data:
+
+                human_readable_date, year, month, day, timestamp = LoadStock().GeneralFunctions().extract_date_information_from_human_readable_date_string(date)
+                try:
+                    
+                    dividends.append({'timestamp': timestamp, 'human_readable_date': human_readable_date, 'value': float(data[date]['7. dividend amount'])})
+                    splits.append({'timestamp': timestamp, 'human_readable_date': human_readable_date, 'value': float(data[date]['8. split coefficient'])})
+
+                    prices_by_time.append({'year': year,
+                                           'month': month,
+                                           'day': day,
+                                           'timestamp': timestamp,
+                                           'human_readable_date': human_readable_date,
+                                           'raw_open': float(data[date]['1. open']),
+                                           'raw_close': float(data[date]['4. close']),
+                                           'raw_low':  float(data[date]['3. low']),
+                                           'close': float(data[date]['5. adjusted close']),}) #get rid of adjusted close after expiriment is over
+                except:
+                    print(traceback.format_exc())
+
+            self.stock = LoadStock().GeneralFunctions().create_time_sorted_dictionary(prices_by_time)
+            
+            dividends = LoadStock().GeneralFunctions().create_time_sorted_dictionary(dividends)
+            dividend_adjustment_factor_by_day = LoadStock().AdjustStockPrice().calculate_cash_dividend_adjustment_factor_by_date(self.stock, dividends)
+            
+            splits = LoadStock().GeneralFunctions().create_time_sorted_dictionary(splits)
+            split_adjustment_factor_by_day = LoadStock().AdjustStockPrice().calculate_split_adjustment_factor_by_date(self.stock, splits)
+
+            self.stock = LoadStock().AdjustStockPrice().calculate_adjusted_value_by_date(self.stock, split_adjustment_factor_by_day, dividend_adjustment_factor_by_day, "low")
+            self.stock = LoadStock().AdjustStockPrice().calculate_adjusted_value_by_date(self.stock, split_adjustment_factor_by_day, dividend_adjustment_factor_by_day, "open")
+
+            if Assumptions.ignore_dividends:
+                self.stock = LoadStock().AdjustStockPrice().alter_adjusted_price_to_ignore_dividends(self.stock, dividend_adjustment_factor_by_day, "close")
+                self.stock = LoadStock().AdjustStockPrice().alter_adjusted_price_to_ignore_dividends(self.stock, dividend_adjustment_factor_by_day, "open")
+                self.stock = LoadStock().AdjustStockPrice().alter_adjusted_price_to_ignore_dividends(self.stock, dividend_adjustment_factor_by_day, "low")
+            return self.stock
+
+        
+    def load_stock(self, Assumptions, ticker):
+        try:
+            if Assumptions.excel_or_api == "tiingo":
+                stock = self.FromTiingo().get_data(Assumptions, ticker)
+                    
+            elif Assumptions.excel_or_api == "market_stack":
+                stock = self.FromMarketStack().get_data(Assumptions, ticker)
+
+            elif Assumptions.excel_or_api == "alphavantage":
+                stock = self.FromAlphaVantage().get_data(Assumptions, ticker)
+
+            elif Assumptions.excel_or_api == "excel":
+                stock = self.FromExcel().get_data(Assumptions)
+                
+        except:
+            print(traceback.format_exc())
+            stock = self.FromExcel().get_data(Assumptions)
+
+        return stock
+
+
         
 #######################
 #
@@ -184,6 +492,13 @@ class Metrics:
     def __init__(self, Assumptions, stock):
         self.LoadStock = LoadStock()
         self.vix = self.GetVixData().load_vix_data(Assumptions)
+##        for e in self.vix:
+##            print(e)
+##            print(self.vix[e])
+##        for e in stock:
+##            print(e)
+##            print(stock[e])
+##            print(self.vix[e])
         self.moving_average_by_day_of_stock_price_long = self.calc_moving_avg_of_stock_price_by_day(stock, Assumptions.days_for_moving_average_long)
         self.moving_average_by_day_of_stock_price_short = self.calc_moving_avg_of_stock_price_by_day(stock, Assumptions.days_for_moving_average_short)
         self.moving_average_stock_velocity_by_day = self.calc_moving_avg_of_daily_stock_velocity_by_day(stock, Assumptions)
@@ -191,22 +506,22 @@ class Metrics:
         self.percent_above_moving_average = self.calc_percent_of_days_above_moving_average(stock, Assumptions)
         self.velocity_of_difference_between_long_and_short_moving_averages = self.calc_velocity_of_difference_between_long_and_short_moving_averages(Assumptions, self.moving_average_by_day_of_stock_price_long, self.moving_average_by_day_of_stock_price_short)
         self.rsi_by_day = self.CalcRSI().calc_rsi(Assumptions, stock)
+        self.moving_avg_of_velocity_of_difference_between_long_and_short_moving_avgs_by_day = self.calc_moving_avg_of_difference_between_long_and_short_moving_avgs(Assumptions, self.moving_average_by_day_of_stock_price_long, self.moving_average_by_day_of_stock_price_short)
 
     class GetVixData:
         
         def __init__(self):
-            self.file_name = "vix.xls"
             self.vix = {}
             
         def extract_one_row_of_vix_data(self, book, row):
             vix_open = row[1].value
             vix_close = row[4].value
             excel_date = row[0].value
-            year, month, day, hour, minute, second, human_readable_date, timestamp = LoadStock().convert_excel_date_to_component_parts(book, excel_date)
-            return LoadStock().build_dictionary_of_single_day_data(year, month, day, timestamp, human_readable_date, vix_open, vix_close)
+            year, month, day, hour, minute, second, human_readable_date, timestamp = LoadStock().FromExcel().convert_excel_date_to_component_parts(book, excel_date)
+            return LoadStock().GeneralFunctions().build_dictionary_of_single_day_data(year, month, day, timestamp, human_readable_date, vix_open, vix_close)
 
-        def load_vix_data(self, Assumptions):
-            book, sheet = LoadStock().get_sheet_from_excel(Assumptions, self.file_name)
+        def from_excel(self, Assumptions):
+            book, sheet = LoadStock().FromExcel().get_sheet_from_excel(Assumptions, "vix.xls")
             counter = 0
             for row in sheet:
                 if counter > 0:
@@ -214,6 +529,14 @@ class Metrics:
                     if single_day_data != None:
                         self.vix[single_day_data['human_readable_date']] = single_day_data
                 counter += 1
+            return self.vix
+        
+        def load_vix_data(self, Assumptions):
+            try:
+                self.vix = LoadStock().FromMarketStack().get_data(Assumptions, "vix.indx")
+            except:
+                print(traceback.format_exc())
+                self.vix = self.from_excel(Assumptions)
             return self.vix
 
     class CalcRSI:
@@ -309,6 +632,28 @@ class Metrics:
                 pass
         return velocity_of_difference_between_long_and_short_moving_averages_by_day
 
+    def calc_moving_avg_of_difference_between_long_and_short_moving_avgs(self, Assumptions, long_moving_average, short_moving_average):
+        moving_avg_of_velocity_of_difference_between_long_and_short_moving_avgs_by_day = {}
+        velocity_values = []
+        days= 0
+
+        last_price = False
+        for date in long_moving_average:
+            if date in long_moving_average and date in short_moving_average and short_moving_average[date] != None and long_moving_average[date] != None:
+                
+                if days >= Assumptions.moving_average_of_velocity_of_difference_between_long_and_short_moving_avg_days:
+                    sum_of_velocities = sum(velocity_values[-1*Assumptions.moving_average_of_velocity_of_difference_between_long_and_short_moving_avg_days:])
+                    average = sum_of_velocities/Assumptions.moving_average_of_velocity_of_difference_between_long_and_short_moving_avg_days
+                    moving_avg_of_velocity_of_difference_between_long_and_short_moving_avgs_by_day[date] = average
+                    
+                if last_price != False:
+                    difference = long_moving_average[date] - short_moving_average[date]
+                    velocity = difference - last_price
+                    velocity_values.append(velocity)
+                last_price = long_moving_average[date] - short_moving_average[date]
+
+                days += 1
+        return moving_avg_of_velocity_of_difference_between_long_and_short_moving_avgs_by_day        
 
     def calc_vix_velocity_moving_average_by_day(self, Assumptions, vix):
         vix_velocity_moving_average_by_day = {}
@@ -417,7 +762,7 @@ class Triggers:
 
     def __init__(self, Assumptions, stock, Metrics):
         self.buy_and_hold = self.buy_and_hold(stock)
-        self.vix_position_below_high_treshold = self.check_whether_vix_is_below_threshold_by_day(Metrics, Assumptions.vix_high_threshold)
+        self.vix_position_below_high_threshold = self.check_whether_vix_is_below_threshold_by_day(Metrics, Assumptions.vix_high_threshold)
         self.vix_position_below_low_threshold = self.check_whether_vix_is_below_threshold_by_day(Metrics, Assumptions.vix_low_threshold)
         self.vix_position_below_super_high_threshold = self.check_whether_vix_is_below_threshold_by_day(Metrics, Assumptions.vix_super_high_threshold)
         self.vix_position_below_astronomically_high_threshold = self.check_whether_vix_is_below_threshold_by_day(Metrics, Assumptions.vix_astronomically_high_threshold)
@@ -536,11 +881,26 @@ class Triggers:
         for date in Metrics.velocity_of_difference_between_long_and_short_moving_averages:
                 
                 velocity_of_difference_between_long_and_short_below_threshold[date] = {'open': False}
+
                 
                 if Metrics.velocity_of_difference_between_long_and_short_moving_averages[date] >= Assumptions.velocity_of_difference_between_long_and_short_moving_averages_threshold:
                     velocity_of_difference_between_long_and_short_below_threshold[date]['open'] = True
 
         return velocity_of_difference_between_long_and_short_below_threshold
+
+                #REFERENCE FOR BELOW
+                 #moving_average_of_velocity_of_difference_between_long_and_short_moving_avg_threshold = 0,
+                 #moving_average_of_velocity_of_difference_between_long_and_short_moving_avg_days = 10,
+
+                 #FINISH THIS
+##    def check_whether_moving_avg_of_difference_between_long_and_short_below_threshold(self, Assumptions, Metrics):
+##        moving_avg_velocity_of_difference_between_long_and_short_below_threshold = {}
+##
+##        for date in Metrics.moving_avg_of_velocity_of_difference_between_long_and_short_moving_avgs_by_day:
+##            moving_avg_velocity_of_difference_between_long_and_short_below_threshold = {'open': False}
+##
+##            if Metrics.moving_avg_of_velocity_of_difference_between_long_and_short_moving_avgs_by_day[date] <
+            
 
     def check_whether_rsi_is_below_threshold(self, Metrics, rsi_sell_threshold):
         rsi_below_threshold = {}
@@ -572,13 +932,13 @@ class Combos:
 
     def combo_9(self, Triggers):
         combo_9_by_day = {}
-        for date in Triggers.vix_position_below_high_treshold:
+        for date in Triggers.vix_position_below_high_threshold:
             if date in Triggers.stock_price_above_moving_average_long and date in Triggers.moving_avg_stock_velocity_above_threshold and date in Triggers.rsi_below_high_sell_threshold:
 
                 combo_9_by_day[date] = {'open': False}
 
 
-                if Triggers.vix_position_below_high_treshold[date]['open'] == True: #VIX IS BELOW HIGH
+                if Triggers.vix_position_below_high_threshold[date]['open'] == True: #VIX IS BELOW HIGH
                     if (Triggers.vix_velocity_between_thresholds[date]['open'] == True
                         and Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True
                         and Triggers.rsi_below_high_sell_threshold[date]['open'] == True):
@@ -603,13 +963,13 @@ class Combos:
 
     def combo_8(self, Triggers):
         combo_8_by_day = {}
-        for date in Triggers.vix_position_below_high_treshold:
+        for date in Triggers.vix_position_below_high_threshold:
             if date in Triggers.stock_price_above_moving_average_long and date in Triggers.moving_avg_stock_velocity_above_threshold and date in Triggers.rsi_below_high_sell_threshold:
 
                 combo_8_by_day[date] = {'open': False}
 
 
-                if Triggers.vix_position_below_high_treshold[date]['open'] == True: #VIX IS BELOW HIGH
+                if Triggers.vix_position_below_high_threshold[date]['open'] == True: #VIX IS BELOW HIGH
                     if (Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True
                         and Triggers.rsi_below_high_sell_threshold[date]['open'] == True):
                     
@@ -635,12 +995,12 @@ class Combos:
 
     def combo_7(self, Triggers):
         combo_7_by_day = {}
-        for date in Triggers.vix_position_below_high_treshold:
+        for date in Triggers.vix_position_below_high_threshold:
             if date in Triggers.stock_price_above_moving_average_long and date in Triggers.moving_avg_stock_velocity_above_threshold and date in Triggers.rsi_below_high_sell_threshold:
 
                 combo_7_by_day[date] = {'open': False}
 
-                if Triggers.vix_position_below_high_treshold[date]['open'] == True: #VIX IS BELOW HIGH
+                if Triggers.vix_position_below_high_threshold[date]['open'] == True: #VIX IS BELOW HIGH
                     if Triggers.vix_velocity_between_thresholds[date]['open'] == True:
                     
                         combo_7_by_day[date]['open'] = True
@@ -664,14 +1024,14 @@ class Combos:
                     
     def combo_6(self, Triggers):
         combo_6 = {}
-        for date in Triggers.vix_position_below_high_treshold:
+        for date in Triggers.vix_position_below_high_threshold:
             if date in Triggers.stock_price_above_moving_average_long and date in Triggers.moving_avg_stock_velocity_above_threshold and date in Triggers.rsi_below_high_sell_threshold:
                 
                 combo_6[date] = {'open': False}
 
                 if Triggers.rsi_below_high_sell_threshold[date]['open'] == True:
 
-                    if (Triggers.vix_position_below_high_treshold[date]['open'] == True and #VIX BELOW HIGH
+                    if (Triggers.vix_position_below_high_threshold[date]['open'] == True and #VIX BELOW HIGH
                         Triggers.vix_velocity_between_thresholds[date]['open'] == True):
 
                         combo_6[date]['open'] = True
@@ -694,7 +1054,7 @@ class Combos:
 
     def combo_5(self, Triggers):
         combo_5 = {}
-        for date in Triggers.vix_position_below_high_treshold:
+        for date in Triggers.vix_position_below_high_threshold:
             if date in Triggers.stock_price_above_moving_average_long and date in Triggers.moving_avg_stock_velocity_above_threshold:
                 
                 combo_5[date] = {'open': False}
@@ -708,7 +1068,7 @@ class Combos:
 
     def combo_4(self, Triggers):
         combo_4 = {}
-        for date in Triggers.vix_position_below_high_treshold:
+        for date in Triggers.vix_position_below_high_threshold:
             if date in Triggers.stock_price_above_moving_average_long and date in Triggers.moving_avg_stock_velocity_above_threshold:
                 
                 combo_4[date] = {'open': False}
@@ -725,12 +1085,12 @@ class Combos:
 
     def combo_3(self, Triggers):
         combo_3 = {}
-        for date in Triggers.vix_position_below_high_treshold:
+        for date in Triggers.vix_position_below_high_threshold:
             if date in Triggers.stock_price_above_moving_average_long and date in Triggers.moving_avg_stock_velocity_above_threshold:
                 
                 combo_3[date] = {'open': False}
 
-                if Triggers.vix_position_below_high_treshold[date]['open'] == True: #VIX BELOW HIGH
+                if Triggers.vix_position_below_high_threshold[date]['open'] == True: #VIX BELOW HIGH
 
                     combo_3[date]['open'] = True
                     
@@ -745,12 +1105,12 @@ class Combos:
 
     def combo_2(self, Triggers):
         combo_2 = {}
-        for date in Triggers.vix_position_below_high_treshold:
+        for date in Triggers.vix_position_below_high_threshold:
             if date in Triggers.stock_price_above_moving_average_long and date in Triggers.moving_avg_stock_velocity_above_threshold:
                 
                 combo_2[date] = {'open': False}
                 
-                if Triggers.vix_position_below_high_treshold[date]['open'] == True: #VIX BELOW HIGH
+                if Triggers.vix_position_below_high_threshold[date]['open'] == True: #VIX BELOW HIGH
                     
                     combo_2[date]['open'] = True
 
@@ -763,12 +1123,12 @@ class Combos:
 
     def combo_1(self, Triggers):
         combo_1 = {}
-        for date in Triggers.vix_position_below_high_treshold:
+        for date in Triggers.vix_position_below_high_threshold:
             if date in Triggers.stock_price_above_moving_average_long:
                 
                 combo_1[date] = {'open': False}
                 
-                if Triggers.vix_position_below_high_treshold[date]['open'] == True: #VIX BELOW HIGH
+                if Triggers.vix_position_below_high_threshold[date]['open'] == True: #VIX BELOW HIGH
                     combo_1[date]['open'] = True
                     
                 elif Triggers.stock_price_above_moving_average_long[date]['open'] == True: #VIX ABOVE HIGH
@@ -785,6 +1145,56 @@ class Combos:
 #
 #######################
 
+    #######################
+    #
+    # COMPARE DATA SOURCES
+    #
+    #######################
+
+def compare_data_source(Assumptions):
+    excel = LoadStock().FromExcel().get_data(Assumptions)
+    market_stack = LoadStock().FromMarketStack().get_data(Assumptions, Assumptions.stock)
+    tiingo = LoadStock().FromTiingo().get_data(Assumptions, Assumptions.stock)
+    alphavantage = LoadStock().FromAlphaVantage().get_data(Assumptions, Assumptions.stock)
+
+    rows = ["A", "B", "C", "D", "E', "F', "G', "H", "I", "J", "K", "L", "M", "N", "O", "P" , "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+    data_sources = {'excel': excel, 'market_stack': market_stack, 'tiingo': tiingo, 'alpha_vantage': alphavantage}
+    data_fields = ['raw_open', 'raw_close', 'open', 'close']
+                    
+    with xlsxwriter.Workbook(Assumptions.location_of_excel_folders + 'all_data_sources.xlsx') as workbook:
+        currency_format = workbook.add_format({'num_format': '$#,##0.00;[Red]($#,##0.00)'})
+        date_format = workbook.add_format({'num_format': 'm/d/yy'})
+
+        data = []
+        headers = [{'header': 'date', 'format': date_format}]
+        for date in tiingo: #assumption is that tiingo has most days covered
+            single_row_data = []
+            single_row_data.append(excel_date(datetime.datetime(tiingo[date]['year'], tiingo[date]['month'], tiingo[date]['day'])))
+
+            counter = 0
+            for data_source in data_sources:
+                for field in data_fields:
+                    
+                    if data_source + field not in headers:
+                        headers.append({'header': data_source + field, 'format': currency_format})
+
+                    try:
+                        single_row_data.append(data_sources[data_source][date][field])
+                    except:
+                        #print(traceback.format_exc())
+                        single_row_data.append("")
+
+                    counter += 1
+            data.append(single_row_data)
+                        
+        worksheet = workbook.add_worksheet()
+        worksheet.add_table(0,
+                            0,
+                            len(data),
+                            counter,
+                            {'data': data,
+                             'columns': headers})
+        
     #######################
     #
     # VIEW STRATEGY ALONGSIDE RELEVANT METRICS BY DAY
@@ -812,6 +1222,12 @@ def create_view_strategy_alongside_relevant_metrics_by_day_data(strategy_name, s
         except:
             strategy_aggregate_return = last_strategy_aggregate_return - 1
             strategy_daily_return = ""
+
+        try:
+            dividend = stock[date]['aggregate_dividend']
+        except:
+            #print(traceback.format_exc())
+            dividend = ""
             
         
         try:
@@ -837,6 +1253,7 @@ def create_view_strategy_alongside_relevant_metrics_by_day_data(strategy_name, s
         try:
             vix = Metrics.vix[date]['open']
         except:
+            #print(traceback.format_exc())
             vix = ""
 
         try:
@@ -853,10 +1270,12 @@ def create_view_strategy_alongside_relevant_metrics_by_day_data(strategy_name, s
             rsi_by_day = Metrics.rsi_by_day[date]
         except:
             rsi_by_day = ""
+
             
         list_to_write.append([msft_date,
                               stock[date]['open'],
                               stock[date]['close'],
+                              dividend,
                               stock_daily_return,
                               stock_aggregate_return,
                               strategy_daily_return,
@@ -896,6 +1315,7 @@ def write_view_strategy_alongside_relevant_metrics_by_day_to_excel(data_for_exce
                                  'columns': [{'header': 'date', 'format': date_format},
                                              {'header': 'Stock Open', 'format': currency_format},
                                              {'header': 'Stock Close', 'format': currency_format},
+                                             {'header': 'Aggregate Dividend', 'format': currency_format},
                                              {'header': 'Stock Daily Return', 'format': percentage_format},
                                              {'header': 'Stock Agg Return', 'format': percentage_format},
                                              {'header': 'Strategy Daily Return', 'format': percentage_format},
@@ -910,16 +1330,16 @@ def write_view_strategy_alongside_relevant_metrics_by_day_to_excel(data_for_exce
                                              {'header': 'Stock Mov Avg Difference Velocity Percentile', 'format': negative_number_format},
                                              {'header': 'Stock Mov Avg Velocity', 'format': negative_number_format},
                                              {'header': 'RSI', 'format': negative_number_format},
-                                    ]})
+                                                ]})
             chart = workbook.add_chart({'type': 'line'})
             
-            chart.add_series({'name': '=\'' + data_title + "\'!$E$1",
+            chart.add_series({'name': '=\'' + data_title + "\'!$F$1",
                               'categories': '=\'' + data_title + "\'!$A2:$A" + str(len(data_for_excel[data_title])),
-                              'values': '=\'' + data_title + "\'!$E2:$E" + str(len(data_for_excel[data_title]))})
+                              'values': '=\'' + data_title + "\'!$F2:$F" + str(len(data_for_excel[data_title]))})
             
-            chart.add_series({'name': '=\'' + data_title + "\'!$G$1",
+            chart.add_series({'name': '=\'' + data_title + "\'!$H$1",
                               'categories': '=\'' + data_title + "\'!$A2:$A" + str(len(data_for_excel[data_title])),
-                              'values': '=\'' + data_title + "\'!$G2:$G" + str(len(data_for_excel[data_title]))})
+                              'values': '=\'' + data_title + "\'!$H2:$H" + str(len(data_for_excel[data_title]))})
             
             chart.set_title({'name': "Aggregate Returns Leveraged v. Non Leveraged"})
             worksheet.insert_chart('N2', chart, {'x_offset': 25, 'y_offset': 10})
@@ -936,7 +1356,7 @@ class Returns:
 
     def __init__(self, stock, Triggers, Assumptions, Combos):
         self.buy_and_hold_strategy = self.SingleStrategyReturns(stock, Triggers.buy_and_hold, Assumptions)
-        self.vix_position_high_strategy = self.SingleStrategyReturns(stock, Triggers.vix_position_below_high_treshold, Assumptions)
+        self.vix_position_high_strategy = self.SingleStrategyReturns(stock, Triggers.vix_position_below_high_threshold, Assumptions)
         self.vix_position_low_strategy = self.SingleStrategyReturns(stock, Triggers.vix_position_below_low_threshold, Assumptions)
         self.vix_position_super_high_strategy = self.SingleStrategyReturns(stock, Triggers.vix_position_below_super_high_threshold, Assumptions)
         self.vix_position_astronomically_high_strategy = self.SingleStrategyReturns(stock, Triggers.vix_position_below_astronomically_high_threshold, Assumptions)
@@ -964,22 +1384,41 @@ class Returns:
 
         def __init__(self, stock, triggers_by_day, Assumptions):
             self.leverage_multiple = Assumptions.leverage_multiple
+            self.rolling_stop_loss_threshold = Assumptions.rolling_stop_loss_threshold
+            self.days_out_after_rolling_stop_loss_threshold_met = Assumptions.days_out_after_rolling_stop_loss_threshold_met
+            self.days_actually_out = self.days_out_after_rolling_stop_loss_threshold_met + 1
+            
             self.running_tally_by_day = {}
             self.running_tally_by_day_3x = {}
             self.running_tally = 1
             self.running_tally_3x = 1
             self.running_tally_by_day, self.running_tally_by_day_3x = self.calculate_return_of_stock(stock, triggers_by_day)
 
-        def create_buy_sell_orders(self, triggers_by_day, stock):
+        def rolling_stop_loss_threshold_met(self, stock, date):
+            try: #if there is no low key, except is hit
+                day_loss = ((stock[date]['low'] - stock[date]['open'])/stock[date]['open']) * 100
+                if day_loss < (self.rolling_stop_loss_threshold * -1):
+                    return True
+            except:
+                pass
+            return False
+
+        def create_buy_sell_orders(self, triggers_by_day, stock, implement_rolling_stop_loss):
             last_date_we_have_data_for_stock = list(triggers_by_day.keys())[-1]
             buy_and_sell_orders_by_day = {}
             currently_holding_stock = False
             
-            for date in triggers_by_day: #this assumes all buy and sells orders are triggered at open
+            for date in triggers_by_day: #this assumes all buy and sells orders are triggered at open, except for rolling_stop_loss
                 buy_and_sell_orders_by_day[date] = None
                 if date in stock:
-                        
-                    if triggers_by_day[date]['open']:
+
+                    self.days_actually_out += 1
+                    if implement_rolling_stop_loss and currently_holding_stock and self.rolling_stop_loss_threshold_met(stock, date):
+                        buy_and_sell_orders_by_day[date] = "stop_loss_threshold_met"
+                        self.days_actually_out = 0
+                        currently_holding_stock = False
+                    
+                    elif triggers_by_day[date]['open'] and self.days_actually_out >= self.days_out_after_rolling_stop_loss_threshold_met:
                         if not currently_holding_stock:
                             buy_and_sell_orders_by_day[date] = "buy"
                             currently_holding_stock = True
@@ -990,12 +1429,21 @@ class Returns:
                         buy_and_sell_orders_by_day[date] = "sell"
                         currently_holding_stock = False
 
+                    if currently_holding_stock:
+                        self.days_actually_out = self.days_out_after_rolling_stop_loss_threshold_met + 1
+
             return buy_and_sell_orders_by_day
         
         def calculate_current_return(self, current_price, last_price):
             running_tally = self.running_tally * (1+ ((current_price - last_price)/last_price))
             running_tally_3x = self.running_tally_3x * (1+ (((current_price - last_price)/last_price) * self.leverage_multiple))
             return running_tally, running_tally_3x
+
+        def calculate_current_return_after_stop_loss_threshold_met(self, last_price):
+            last_price = last_price * (1 + (-1 * (self.rolling_stop_loss_threshold/100)))
+            running_tally = self.running_tally * (1+ (-1 * (self.rolling_stop_loss_threshold/100)))
+            running_tally_3x = self.running_tally_3x * (1+ ((-1 * (self.rolling_stop_loss_threshold/100)) * self.leverage_multiple))
+            return running_tally, running_tally_3x, last_price           
         
         def add_running_tally_by_day_open_data(self, stock, date, last_price):
             try: #if last price is False, we have not made any returns yet
@@ -1022,25 +1470,32 @@ class Returns:
             self.running_tally_by_day_3x[date]['close_running_tally'] = self.running_tally_3x
             self.running_tally_by_day_3x[date]['buy_sell_order'] = buy_and_sell_orders_by_day[date]
 
-        def calculate_return_of_stock(self, stock, triggers_by_day):
-            buy_and_sell_orders_by_day = self.create_buy_sell_orders(triggers_by_day, stock)
+        def calculate_return_of_stock(self, stock, triggers_by_day, implement_rolling_stop_loss=False):
+            
+            try:
+                buy_and_sell_orders_by_day = self.create_buy_sell_orders(triggers_by_day, stock, implement_rolling_stop_loss)
 
-            last_price = False 
-            for date in buy_and_sell_orders_by_day:
-                if date in stock and buy_and_sell_orders_by_day[date] != None:
-                    self.add_running_tally_by_day_open_data(stock, date, last_price)
+                last_price = False 
+                for date in buy_and_sell_orders_by_day:
+                    if date in stock and buy_and_sell_orders_by_day[date] != None:
+                        self.add_running_tally_by_day_open_data(stock, date, last_price)
 
-                    if buy_and_sell_orders_by_day[date] == "buy":
-                        last_price = stock[date]['open']
+                        if buy_and_sell_orders_by_day[date] == "buy":
+                            last_price = stock[date]['open']
 
-                    if buy_and_sell_orders_by_day[date] == "sell":
-                        self.running_tally, self.running_tally_3x = self.calculate_current_return(stock[date]['open'], last_price)
+                        if buy_and_sell_orders_by_day[date] == "sell":
+                            self.running_tally, self.running_tally_3x = self.calculate_current_return(stock[date]['open'], last_price)
 
-                    else: 
-                        self.running_tally, self.running_tally_3x = self.calculate_current_return(stock[date]['close'], last_price)
-                        last_price = stock[date]['close']
-                        
-                    self.add_running_tally_by_day_close_data(date, buy_and_sell_orders_by_day)
+                        elif buy_and_sell_orders_by_day[date] == "stop_loss_threshold_met":
+                            self.running_tally, self.running_tally_3x, last_price = self.calculate_current_return_after_stop_loss_threshold_met(last_price)
+                            
+                        else: 
+                            self.running_tally, self.running_tally_3x = self.calculate_current_return(stock[date]['close'], last_price)
+                            last_price = stock[date]['close']
+                            
+                        self.add_running_tally_by_day_close_data(date, buy_and_sell_orders_by_day)
+            except:
+                print(traceback.format_exc())
                         
             return self.running_tally_by_day, self.running_tally_by_day_3x
 
@@ -1088,32 +1543,69 @@ class GenerateReports:
     def __init__(self, strategy_to_see):
         self.strategy_to_see = strategy_to_see
         self.Assumptions = Assumptions()
-        self.stock = LoadStock().load_stock_data(self.Assumptions)
+        self.stock = LoadStock().load_stock(self.Assumptions, self.Assumptions.stock)
         self.Metrics = Metrics(self.Assumptions, self.stock)
         self.date_ranges = [{'name': 'Entire Period', 'start_date': None, 'end_date': None},
-                            {'name': 'Before Dot Com', 'start_date': "1999-03-10", 'end_date': "2000-03-10"},
-                            {'name': 'Dot Com', 'start_date': "2000-03-10", 'end_date': "2002-10-04"},
-                            {'name': 'Between Dot Com and Crisis', 'start_date': "2002-10-04", 'end_date': "2008-05-01"},
-                            {'name': 'Financial Crisis', 'start_date': "2008-05-01", 'end_date': "2009-03-20"},
-                            {'name': 'End Crisis to Pandemic', 'start_date': "2009-03-20", 'end_date': "2020-02-10"},
-                            {'name': 'Top Pandemic to Bottom', 'start_date': "2020-02-10", 'end_date': "2020-03-23"},
-                            {'name': 'Bottom Pandemic to Today', 'start_date': "2020-03-23", 'end_date': "2021-01-19"}]
+                            {'name': 'From TQQQ Inception', 'start_date': '2010-2-11', 'end_date':'2021-2-18'}, 
+                            {'name': 'Before Dot Com', 'start_date': "1999-3-10", 'end_date': "2000-3-10"},
+                            {'name': 'Dot Com', 'start_date': "2000-3-10", 'end_date': "2002-10-4"},
+                            {'name': 'Between Dot Com and Crisis', 'start_date': "2002-10-4", 'end_date': "2008-5-1"},
+                            {'name': 'Financial Crisis', 'start_date': "2008-5-1", 'end_date': "2009-3-20"},
+                            {'name': 'End Crisis to Pandemic', 'start_date': "2009-3-20", 'end_date': "2020-2-10"},
+                            {'name': 'Top Pandemic to Bottom', 'start_date': "2020-2-10", 'end_date': "2020-3-23"},
+                            {'name': 'Bottom Pandemic to Today', 'start_date': "2020-3-23", 'end_date': "2021-1-19"}]
+
+    def stock_date_exists_for_entire_date_range(self, stock, start_date, end_date):
+        if start_date == None and end_date == None:
+            return True
+        if start_date in stock and end_date in stock:
+            return True
+        return False
+            
         
     def create_spreadsheet_of_strategy_and_metrics_by_timeperiod_for_specific_strategy(self):
         data_for_excel = {}
 
         for date_range in self.date_ranges: #for each date range compile list of excel data separately
-            stock, Triggers, Combos, Returns = CalcReturnsBetweenDateRanges(date_range['start_date'], date_range['end_date'], self.stock, self.Assumptions, self.Metrics).calc_triggers_combos_and_returns()
-            data = create_view_strategy_alongside_relevant_metrics_by_day_data(self.strategy_to_see,
-                                                            stock,
-                                                            self.Assumptions,
-                                                            self.Metrics,
-                                                            Triggers,
-                                                            Returns)
-            data_for_excel[date_range['name']] = data
-            
+            try:
+                if self.stock_date_exists_for_entire_date_range(self.stock, date_range['start_date'], date_range['end_date']):
+                    stock, Triggers, Combos, Returns = CalcReturnsBetweenDateRanges(date_range['start_date'], date_range['end_date'], self.stock, self.Assumptions, self.Metrics).calc_triggers_combos_and_returns()
+                    data = create_view_strategy_alongside_relevant_metrics_by_day_data(self.strategy_to_see,
+                                                                    stock,
+                                                                    self.Assumptions,
+                                                                    self.Metrics,
+                                                                    Triggers,
+                                                                    Returns)
+                    data_for_excel[date_range['name']] = data
+            except:
+                print(traceback.format_exc())
+        
         empty = write_view_strategy_alongside_relevant_metrics_by_day_to_excel(data_for_excel, self.Assumptions) #write lists to excel
 
+    def get_first_date_for_stock(self, stock):
+        return stock[list(stock.keys())[0]]['human_readable_date']
+    
+    def get_last_date_for_stock(self, stock):
+        return stock[list(stock.keys())[-1]]['human_readable_date']
+
+    def get_buy_and_sell_count(self, running_tally_by_day):
+        buy = 0
+        sell = 0
+        for date in running_tally_by_day:
+            if running_tally_by_day[date]['buy_sell_order'] == "buy":
+                buy += 1
+            elif running_tally_by_day[date]['buy_sell_order'] == "sell":
+                sell += 1
+        return buy + sell
+
+    def get_days_in_market(self, running_tally_by_day):
+        days_in_market = 0
+
+        for date in running_tally_by_day:
+            if running_tally_by_day[date]['buy_sell_order'] != None:
+                days_in_market += 1
+        return days_in_market
+        
     def print_report_to_IDE(self, start_date, end_date):
         stock, Triggers, Combos, Returns = CalcReturnsBetweenDateRanges(start_date, end_date, self.stock, self.Assumptions, self.Metrics).calc_triggers_combos_and_returns()
         for attribute in [a for a in dir(Returns) if not a.startswith('__')]:
@@ -1123,11 +1615,15 @@ class GenerateReports:
                 strategy_returns = getattr(Returns,attribute)
                 running_tally_by_day = strategy_returns.running_tally_by_day
                 running_tally_by_day_3x = strategy_returns.running_tally_by_day_3x
-
-                print("No Leverage: " + str(get_last_item_in_dictionary_of_dictionaries(running_tally_by_day, 'close_running_tally'))+"x")
-                print("With Leverage: " + str(get_last_item_in_dictionary_of_dictionaries(running_tally_by_day_3x, 'close_running_tally'))+"x")
+                
+                print(self.get_first_date_for_stock(stock) + " to " + self.get_last_date_for_stock(stock))
+                print("Number of Buys and Sells: " + str(self.get_buy_and_sell_count(running_tally_by_day)))
+                print("Days in Market: " + str(self.get_days_in_market(running_tally_by_day)))
+                print("No Leverage: " + str(round(get_last_item_in_dictionary_of_dictionaries(running_tally_by_day, 'close_running_tally'), 1))+"x")
+                print("With Leverage: " + str(round(get_last_item_in_dictionary_of_dictionaries(running_tally_by_day_3x, 'close_running_tally'), 1))+"x")
 
             except:
+                print(traceback.format_exc())
                 print("No Leverage: 1")
                 print("With Leverage: 1")
             print()
@@ -1145,7 +1641,7 @@ class Experiments:
         self.start_date = start_date
         self.end_date = end_date
         self.Assumptions = Assumptions
-        self.stock = LoadStock().load_stock_data(self.Assumptions)
+        self.stock = LoadStock().load_stock(self.Assumptions, self.Assumptions.stock)
         self.Metrics = Metrics(self.Assumptions, self.stock)
         self.stock, self.Triggers, self.Combos, self.Returns = CalcReturnsBetweenDateRanges(self.start_date, self.end_date, self.stock, self.Assumptions, self.Metrics).calc_triggers_combos_and_returns()
         self.running_tally = 1
@@ -1177,7 +1673,7 @@ class Experiments:
             self.calc_running_tally()
             self.buy = False
 
-    def experiment_combo_8_betwee_high_and_super_high_add_vix_velocity(self):
+    def experiment_combo_8_between_high_and_super_high_add_vix_velocity(self):
 
         #adding vix velocity to vix between high and super high
         #but only if you add a lower threshold
@@ -1192,7 +1688,7 @@ class Experiments:
 
                 
                 if (self.Triggers.vix_position_below_super_high_threshold[date]['open'] == True
-                    and self.Triggers.vix_position_below_high_treshold[date]['open'] == False): 
+                    and self.Triggers.vix_position_below_high_threshold[date]['open'] == False): 
 
                     if (self.Triggers.stock_price_above_moving_average_long[date]['open'] == True 
                         and self.Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True 
@@ -1223,7 +1719,7 @@ class Experiments:
 
                 
                 if (self.Triggers.vix_position_below_super_high_threshold[date]['open'] == True
-                    and self.Triggers.vix_position_below_high_treshold[date]['open'] == False): 
+                    and self.Triggers.vix_position_below_high_threshold[date]['open'] == False): 
 
                     if (self.Triggers.stock_price_above_moving_average_long[date]['open'] == True 
                         and self.Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True 
@@ -1296,10 +1792,15 @@ class Experiments:
             try: #if date is not in one of the triggers, you will get an error.
 
                 
-                if self.Triggers.vix_position_below_super_high_threshold[date]['open'] == True: #VIX IS BETWEEN HIGH AND SUPER HIGH
-                    if self.Triggers.vix_position_below_high_treshold[date]['open'] == False:
-                        if (self.Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True
-                            and self.Triggers.rsi_below_high_sell_threshold[date]['open'] == True):
+                if self.Triggers.vix_position_below_high_threshold[date]['open'] == True: #VIX IS BETWEEN HIGH AND SUPER HIGH
+                    #if self.Triggers.vix_position_below_high_threshold[date]['open'] == False:
+                        #if (self.Triggers.moving_avg_stock_velocity_above_threshold[date]['open'] == True
+                            #and self.Triggers.rsi_below_high_sell_threshold[date]['open'] == True):
+
+                                print(date)
+                                print(self.running_tally)
+                                print()
+                                print()
 
                                 ###############################################
                                 # DO NOT ACCIDENTALLY DELETE THE FOLLOWING LINE
@@ -1314,7 +1815,7 @@ class Experiments:
         print(self.running_tally)
 
             
-#Experiments = Experiments(Assumptions(vix_super_high_threshold = 50, moving_avg_stock_velocity_threshold=0)).experiment()
+#Experiments = Experiments(Assumptions(), start_date = "1999-3-10", end_date = "2000-9-05").experiment()
 
 
 
@@ -1325,10 +1826,12 @@ class Experiments:
 #
 #######################
 
-start_date = None #for custom dates, use this format: "1999-03-10".  For the entire data set, use None for start and end date
+start_date = None #for custom dates, use this format: "1999-3-10".  For the entire data set, use None for start and end date
 end_date = None
 strategy_to_see = "combo_8"
 
+
+compare_data_source(Assumptions())
 Reports = GenerateReports(strategy_to_see)
 Reports.print_report_to_IDE(None, None)
 Reports.create_spreadsheet_of_strategy_and_metrics_by_timeperiod_for_specific_strategy()
